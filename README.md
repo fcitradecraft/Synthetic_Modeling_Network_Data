@@ -59,6 +59,34 @@ python main.py --agent_profiles agents/agent_profiles.xlsx
 
 The generator will read merchant patterns, frequencies, payment methods, and average expenses to create realistic transactions between the entities defined in the file.
 
+### Customizing the output file
+
+You are not locked into the default `data/aml_dataset.xlsx` export. Pass a different file path (and optionally a different format) on the command line and the script will create the file in that location—intermediate folders are created automatically.
+
+```bash
+# Write an Excel workbook straight to the project root
+python main.py \
+  --agent_profiles agents/agent_profiles.xlsx \
+  --legit_txns 10000 \
+  --laundering_chains 3 \
+  --individuals 4 \
+  --companies 10 \
+  --start_date 2025-01-01 \
+  --end_date 2025-04-01 \
+  --output testdata001.xlsx
+```
+
+To generate a CSV instead, change both the extension and the `--format` flag:
+
+```bash
+python main.py \
+  --agent_profiles agents/agent_profiles.xlsx \
+  --output exports/run_001/transactions.csv \
+  --format csv
+```
+
+After the command finishes you will find the file at the requested path. The exporter automatically uses your provided name and folder, so any edits to `--output` take effect immediately.
+
 ### BEnt Entities (ATMs/Tellers)
 `BEnt` rows in the agent profiles represent bank entities such as ATMs or teller locations. They provide the IDs and addresses used when cash withdrawals and deposits occur. Be sure to include them in the profile data so cash transactions can reference the correct location. If no `BEnt` information is provided, the generator will create placeholder ATMs.
 
