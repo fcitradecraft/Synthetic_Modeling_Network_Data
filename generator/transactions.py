@@ -10,6 +10,7 @@ from utils.helpers import (
     describe_transaction,
     fake,
 )
+from utils.logger import log
 import pandas as pd
 
 # Common payment types
@@ -148,8 +149,16 @@ def generate_legit_transactions(accounts, entities, n=1000, start_date="2025-01-
     return transactions
 
 
-def generate_profile_transactions(profile_df: pd.DataFrame, start_date: str, end_date: str) -> list[dict]:
-    """Generate transactions using structured agent profiles."""
+def generate_profile_transactions(
+    profile_df: pd.DataFrame,
+    start_date: str,
+    end_date: str,
+    max_transactions: int | None = None,
+) -> tuple[list[dict], int]:
+    """Generate transactions using structured agent profiles.
+
+    Returns a tuple of (ledger_entries, base_transaction_count).
+    """
     start_dt = datetime.strptime(start_date, "%Y-%m-%d")
     end_dt = datetime.strptime(end_date, "%Y-%m-%d")
 
@@ -166,8 +175,26 @@ def generate_profile_transactions(profile_df: pd.DataFrame, start_date: str, end
     pending_deposits: dict[str, float] = {}
 
     transactions = []
+    base_txn_count = 0
+    limit_reached = False
+
+    def register(entries: list[dict]) -> bool:
+        nonlocal base_txn_count, limit_reached
+
+        if limit_reached:
+            return False
+
+        transactions.extend(entries)
+        base_txn_count += 1
+
+        if max_transactions is not None and base_txn_count >= max_transactions:
+            limit_reached = True
+        return not limit_reached
 
     for _, payer in payers.iterrows():
+        if limit_reached:
+            break
+
         patterns = payer.get("merchant_patterns")
         freqs = payer.get("merchant_frequency")
         if not isinstance(patterns, str) or not isinstance(freqs, str):
@@ -191,6 +218,8 @@ def generate_profile_transactions(profile_df: pd.DataFrame, start_date: str, end
         )
 
         for code, freq in zip(pattern_list, freq_list):
+            if limit_reached:
+                break
             try:
                 freq_val = float(freq)
             except ValueError:
@@ -202,6 +231,8 @@ def generate_profile_transactions(profile_df: pd.DataFrame, start_date: str, end
                 continue
 
             for _ in range(num_txns):
+                if limit_reached:
+                    break
                 merchant = eligible.sample(1).iloc[0]
                 tgt_acct_id = merchant.get("account_number")
                 if pd.isna(tgt_acct_id):
@@ -261,10 +292,13 @@ def generate_profile_transactions(profile_df: pd.DataFrame, start_date: str, end
                         atm_location=bent_loc
 
                     )
-                    transactions.extend(entries)
+                    if not register(entries):
+                        break
 
                     deposit_now = random.choice([True, False])
                     if deposit_now:
+                        if limit_reached:
+                            break
                         merch_bank = str(merchant.get("bank"))
                         merch_bents = bents_by_bank.get(merch_bank, [])
                         if merch_bents:
@@ -289,7 +323,8 @@ def generate_profile_transactions(profile_df: pd.DataFrame, start_date: str, end
                             atm_id=bent2,
                             atm_location=bent2_loc,
                         )
-                        transactions.extend(entries)
+                        if not register(entries):
+                            break
                     else:
                         pending_deposits[tgt_acct.id] = pending_deposits.get(tgt_acct.id, 0) + amount
                 else:
@@ -306,7 +341,8 @@ def generate_profile_transactions(profile_df: pd.DataFrame, start_date: str, end
                         known_accounts=known_accounts,
                         post_date=post_date
                     )
-                    transactions.extend(entries)
+                    if not register(entries):
+                        break
 
     # Generate payroll transactions
     employees = profile_df[(profile_df["type"] == "person") & profile_df["employer"].notna()]
@@ -314,7 +350,11 @@ def generate_profile_transactions(profile_df: pd.DataFrame, start_date: str, end
     payroll_dates = get_payroll_dates(start_dt, end_dt)
 
     for pay_date in payroll_dates:
+        if limit_reached:
+            break
         for _, emp in employees.iterrows():
+            if limit_reached:
+                break
             employer_id = emp.get("employer")
             if employer_id not in companies.index:
                 continue
@@ -369,10 +409,13 @@ def generate_profile_transactions(profile_df: pd.DataFrame, start_date: str, end
                     e["source_description"] = f"ACH Direct Dep Payroll {comp_acct.owner_name} - {comp_acct.address}"
                 else:
                     e["source_description"] = f"ACH Payroll {emp_acct.owner_name} - {emp_acct.id}"
-            transactions.extend(entries)
+            if not register(entries):
+                break
 
     # Batch deposit accumulated cash for merchants/companies
     for acct_id, amt in pending_deposits.items():
+        if limit_reached:
+            break
         merchant_row = merchants[merchants["account_number"] == acct_id]
         if merchant_row.empty:
             continue
@@ -415,6 +458,13 @@ def generate_profile_transactions(profile_df: pd.DataFrame, start_date: str, end
             atm_id=bent_id,
             atm_location=bent_loc
         )
-        transactions.extend(entries)
+        if not register(entries):
+            break
 
-    return transactions
+    if limit_reached and max_transactions is not None:
+        log(
+            f"⚖️ Trimmed profile-driven transactions to requested limit "
+            f"({base_txn_count}/{max_transactions})"
+        )
+
+    return transactions, base_txn_count

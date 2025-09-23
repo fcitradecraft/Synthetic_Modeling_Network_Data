@@ -48,12 +48,16 @@ def main():
     if args.agent_profiles:
         log(f"📂 Loading agent profiles from {args.agent_profiles}")
         profile_df = pd.read_excel(args.agent_profiles, sheet_name="Combined_Data")
-        legit_txns = generate_profile_transactions(
+        legit_txns, base_txn_count = generate_profile_transactions(
             profile_df=profile_df,
             start_date=args.start_date,
             end_date=args.end_date,
+            max_transactions=args.legit_txns,
         )
-        log(f"✅ Profile-based transactions generated: {len(legit_txns)}")
+        log(
+            f"✅ Profile-based transactions generated: {base_txn_count} base transactions "
+            f"({len(legit_txns)} ledger entries)"
+        )
     else:
         log("📊 Generating legitimate transactions...")
         legit_txns = generate_legit_transactions(
