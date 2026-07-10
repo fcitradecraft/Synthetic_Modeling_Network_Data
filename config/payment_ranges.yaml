@@ -1,0 +1,149 @@
+# Payment-rail value/volume calibration, researched and segmented 2026-07-10.
+# See CLAUDE memory / session notes for the sourced research memo this was
+# built from (Fed Diary of Consumer Payment Choice, Nacha, BLS, Fedwire,
+# JPMorgan Chase Institute small-business study, etc.) - every number below
+# is a reasonable estimate extrapolated from that research, not law. Amounts
+# are USD, already at real-world scale (no additional multiplier needed for
+# the person tables; company tables get multiplied by the entity's own
+# `transaction_scaler` column downstream, same as `average_expense` already is).
+#
+# HOW TO EDIT: every range below is a plain [min, max] pair. To make a
+# segment's P2P spending bigger, change payment_type_ranges.persons.<seg>.p2p.
+# To move a company from one segment to another, cut its entity_id from one
+# list under company_segments and paste it into another. Nothing else in the
+# codebase needs to change for either edit to take effect.
+
+# ---------------------------------------------------------------------------
+# SEGMENT DEFINITIONS
+# ---------------------------------------------------------------------------
+
+# Person segment = f(income_level, employment_status). Both columns already
+# exist in Combined_Data for all 22 persons - no new schema field needed.
+# Rows marked DRAFT - no case don't occur in the current 22-person roster;
+# they're filled in defensively so a future roster addition doesn't crash.
+person_segment_matrix:
+  Low:
+    Employed: P1
+    Self-employed: P2
+    Unemployed: P1        # DRAFT - no case today; falls back to P1 (low, no client-payment channel)
+  Medium:
+    Employed: P3
+    Self-employed: P4
+    Unemployed: P3         # DRAFT - no case today
+  High:
+    Employed: P5
+    Self-employed: P5      # DRAFT - no case today; treated as P5
+    Unemployed: P6          # confirmed by Rio 2026-07-10: explained unearned income
+                            # (trust/investment/rental), not deliberately unexplained wealth
+
+# Company segment: explicit assignment by entity_id, not a NAICS-code
+# formula - 11 of 34 companies have no naics_description populated (known
+# pre-existing gap, see project memory), so a formula can't cover all 34.
+# Classified by hand from name + naics_description where present.
+company_segments:
+  C1:  # consumer-facing retail / food & beverage - cash+POS heavy, high frequency, small ticket
+    - COMP1010  # Sahara - General Merchandise Retailers
+    - COMP1011  # Great Gas - Gasoline Stations and Fuel Dealers
+    - COMP1012  # Dinoco - Gasoline Stations and Fuel Dealers
+    - COMP1013  # Couture Designs - Clothing Retailers
+    - COMP1014  # Brittany's - Clothing Retailers
+    - COMP1015  # Couture Designs - Clothing Retailers
+    - COMP1022  # Mackeys - Food Services and Drinking Places
+    - COMP1026  # The Melange Lounge LLC
+    - COMP1027  # Arrakis Cantina & Bar
+    - COMP1028  # Giedi Prime Gastropub
+    - COMP1031  # Bene Gesserit Bistro
+    - COMP1032  # Kwisatz Kitchen Inc
+    - COMP1034  # Chani's Kitchen & Catering
+  C2:  # manufacturing / wholesale - B2B ACH/wire/check, larger ticket, lower frequency, near-zero cash
+    - COMP1023  # Trailers by Tom - Motor Home Manufacturing
+    - COMP1001  # Charmont Paper Products
+    - COMP1003  # Renewal by Gerald - Compost Manufacturing
+    - COMP1004  # Graham-Potts - Construction Machinery Manufacturing
+    - COMP1005  # Mccormick Ltd - Measuring/Controlling Device Manufacturing
+    - COMP1006  # Marcus Furniture
+    - COMP1007  # Rio Titan - Gold/Silver Ore Mining
+    - COMP1009  # Generators and Trasformers Inc
+  C3:  # professional / real estate / trade / finance - wire+check dominant, invoice-driven
+    - COMP1002  # Hopkins, Branch and Flores - Business Associations
+    - COMP1008  # Seaside Dock Management - Marinas
+    - COMP1016  # Speedee Delivery
+    - COMP1017  # Mr. Delivery
+    - COMP1018  # Grilli and Gallegos - Funds, Trusts and Other Financial Vehicles
+    - COMP1019  # Golden Key Realtors
+    - COMP1020  # KW Homes
+    - COMP1021  # Office Waste Retrieval
+    - COMP1024  # TADECO LLC - fbo F. Markos Trust
+    - COMP1025  # Spice Flow GmbH - US Operations
+    - COMP1029  # Fremen Food Distributors LLC
+    - COMP1030  # Dune Imports & Exports Inc
+    - COMP1033  # Corrino Capital Partners
+
+# ---------------------------------------------------------------------------
+# ORDINARY-SPENDING RANGES (the type/amount consistency fix)
+# ---------------------------------------------------------------------------
+# Used by generate_profile_transactions' legit-purchase loop and by
+# generate_company_revenue_transactions. Amount is still drawn from the
+# counterparty's average_expense (unchanged - that field is already
+# hand-calibrated across 171 merchants + 34 companies). payment_type is then
+# chosen only from among the counterparty's accepted methods whose range
+# here actually contains that amount - this is the fix for payment_type and
+# amount being picked independently (e.g. a $30,000 purchase rolling as P2P).
+#
+# Card types (ccard/credit/debit/pos) are kept distinct per Rio's call
+# 2026-07-10, not consolidated into one "card" type, even though their
+# ranges below are close - they're separately editable if real behavior
+# diverges later (e.g. credit skewing to larger/revolving purchases).
+payment_type_ranges:
+  persons:
+    P1: {p2p: [10, 90],   ccard: [8, 90],  credit: [8, 100], debit: [8, 80],  pos: [8, 90],  wire: [1000, 5000],  check: [50, 500],   c_check: [500, 3000],  ach: [50, 3000],   cash: [40, 130]}
+    P2: {p2p: [10, 120],  ccard: [8, 90],  credit: [8, 100], debit: [8, 80],  pos: [8, 90],  wire: [1000, 3000],  check: [50, 500],   c_check: [500, 3000],  ach: [50, 3000],   cash: [40, 150]}
+    P3: {p2p: [15, 150],  ccard: [10, 150],credit: [10, 180],debit: [10, 130],pos: [10, 150],wire: [1500, 10000], check: [75, 1000],  c_check: [750, 5000],  ach: [75, 5000],   cash: [60, 160]}
+    P4: {p2p: [15, 150],  ccard: [10, 150],credit: [10, 180],debit: [10, 130],pos: [10, 150],wire: [1500, 8000],  check: [75, 1000],  c_check: [750, 5000],  ach: [75, 5000],   cash: [60, 170]}
+    P5: {p2p: [20, 200],  ccard: [15, 500],credit: [15, 600],debit: [15, 300],pos: [15, 500],wire: [3000, 25000], check: [150, 2500], c_check: [1500, 10000],ach: [150, 10000], cash: [80, 200]}
+    P6: {p2p: [20, 200],  ccard: [15, 500],credit: [15, 600],debit: [15, 300],pos: [15, 500],wire: [2500, 9000],  check: [150, 2500], c_check: [1500, 10000],ach: [150, 9000],  cash: [80, 200]}
+  companies:
+    C1: {ccard: [8, 60],   credit: [8, 80],   debit: [8, 50],   pos: [8, 60],   cash: [500, 1500], ach: [200, 3000],  check: [200, 3000],  c_check: [1000, 8000],  wire: [1000, 15000],  p2p: [10, 200]}
+    C2: {ccard: [0, 0],    credit: [0, 0],    debit: [0, 0],    pos: [0, 0],    cash: [0, 0],      ach: [500, 10000], check: [500, 10000], c_check: [1000, 15000], wire: [2000, 25000],  p2p: [0, 0]}
+    C3: {ccard: [20, 200], credit: [20, 250], debit: [20, 150], pos: [20, 200], cash: [0, 500],    ach: [300, 5000],  check: [300, 5000],  c_check: [1500, 15000], wire: [2000, 50000],  p2p: [0, 0]}
+
+# [0, 0] means "not realistic for this segment" - a manufacturing company
+# (C2) taking cash or P2P, or a professional-services firm (C3) taking P2P,
+# is exactly the kind of mismatch an investigator should be able to flag.
+# The filter treats [0, 0] as "excludes this type even if accepted_payment_methods
+# lists it" rather than silently allowing a $0 transaction.
+
+# ---------------------------------------------------------------------------
+# PAYROLL (dedicated function - not the accepted-methods filter above)
+# ---------------------------------------------------------------------------
+# Biweekly amount, replacing the flat `random.uniform(4500,5500) * scaler`
+# formula, which ran 1.5-2.4x above BLS-grounded wages for Low/Medium tiers.
+# Only segments with an `employer` value in the current roster are payroll
+# recipients (P1, P3, P5) - P2/P4/P6 have no employer and use the tables
+# below instead.
+payroll_biweekly:
+  P1: [950, 1450]
+  P3: [1750, 2700]
+  P5: [3300, 5800]
+
+# ---------------------------------------------------------------------------
+# SELF-EMPLOYED CLIENT PAYMENTS (new channel - Finding A fix)
+# ---------------------------------------------------------------------------
+# The 6 self-employed persons in the current roster (employer is blank) have
+# no income channel at all today. This models irregular client/customer
+# payments instead of a biweekly paycheck - amount and frequency are both
+# irregular, which is itself part of what makes self-employment income look
+# realistic next to salaried payroll.
+client_payment:
+  P2: {amount: [50, 450],   per_month: [3, 6], payment_types: [p2p, cash, ach]}
+  P4: {amount: [350, 2200], per_month: [2, 5], payment_types: [ach, check]}
+
+# ---------------------------------------------------------------------------
+# UNEARNED INCOME (new channel - P6, Finding A fix for the 2 unemployed persons)
+# ---------------------------------------------------------------------------
+# Chad Harrison and David Caladan: Unemployed + High income_level. Confirmed
+# by Rio 2026-07-10 as explained unearned income (trust distribution,
+# investment income, rental income), not a deliberately unexplained-wealth
+# pattern. Modeled as a periodic distribution rather than a paycheck.
+unearned_income:
+  P6: {amount: [2500, 9000], frequency: monthly, payment_types: [ach, wire]}

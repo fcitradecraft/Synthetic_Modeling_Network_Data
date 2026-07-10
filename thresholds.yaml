@@ -1,0 +1,130 @@
+# Per-rule_id firing parameters for the 17 in-scope Actimize Alert Matrix
+# rules (the 6 Historical Profile Deviation / HBS rules are deprioritized -
+# see CLAUDE_CODE_HANDOFF.md and the rebuild plan).
+#
+# IMPORTANT - only one number in this file is settled regulation: the
+# $10,000 CTR threshold (31 CFR 1010.311), which 31 CFR 1010.314
+# structuring is defined against. Every other threshold_amount,
+# window_days, min_count etc. below is a DRAFT proposed value - a
+# business/risk-tuning judgment call, not law. Flagged for Rio's review
+# before treating any of these as final. Rules marked `built: false` are
+# documented here for the taxonomy but have no injector yet this round.
+
+review_date_range_days: 30  # analyst lookback window applied at review time, not generation time
+
+rules:
+  # --- CTY: single-transaction, reference-list-based ---
+  AML-TSD-EFT-ALL-A-S01-CTY:
+    built: true
+    description: "Transfer to/from High-Risk Countries"
+    # any amount to/from a listed high-risk country triggers - no amount threshold
+    high_risk_country_list: config/high_risk_countries.yaml
+    # DRAFT - relative likelihood this rule is picked when a flagged account
+    # is a person vs. a company (see run_rule_injections_by_count in main.py).
+    # International wire activity reads more plausibly on a business.
+    account_type_weight: {person: 0.5, company: 2.0}
+
+  # --- DST: structuring, single account, single day, sub-$10K ---
+  AML-STR-CCE-INN-A-D01-DST:
+    built: true
+    description: "Daily Cash-Equivalent Deposits Structuring"
+    ctr_threshold: 10000          # regulatory (31 CFR 1010.311/.314)
+    deposit_min: 8200             # DRAFT - proposed structuring range
+    deposit_max: 9800             # DRAFT
+    window_days: 1
+    min_deposits: 2               # DRAFT - min pieces to aggregate above ctr_threshold in one day
+    account_type_weight: {person: 1.0, company: 1.5}  # DRAFT - cash-intensive businesses skew higher
+  AML-STR-CCE-OUT-A-D01-DST:
+    built: true
+    description: "Daily Cash-Equivalent Withdrawals Structuring"
+    ctr_threshold: 10000
+    withdrawal_min: 8200          # DRAFT
+    withdrawal_max: 9800          # DRAFT
+    window_days: 1
+    min_withdrawals: 2            # DRAFT
+    account_type_weight: {person: 1.0, company: 1.5}  # DRAFT
+
+  # --- EAT: excessive activity over a window, single account ---
+  AML-ATM-ATM-OUT-A-D05-EAT:
+    built: true
+    description: "Excessive Short Period ATM Withdrawals"
+    threshold_amount: 3000        # DRAFT - aggregate ATM OUT over window_days
+    window_days: 5
+    account_type_weight: {person: 2.0, company: 0.5}  # DRAFT - ATM cash reads far more naturally on a personal account
+  AML-ATM-ATM-OUT-A-M01-EAT:
+    built: true
+    description: "Excessive Monthly ATM Withdrawals"
+    threshold_amount: 8000        # DRAFT
+    window_days: 30
+    account_type_weight: {person: 2.0, company: 0.5}  # DRAFT
+  AML-ATM-ATM-OUT-P-D05-EAT:
+    built: false                  # party-group scope - deferred, needs party_id-aware dispatch
+    description: "Excessive Short Period ATM Withdrawals in Party Group"
+    threshold_amount: 3000        # DRAFT
+    window_days: 5
+  AML-ECT-CCE-INN-A-D01-EAT:
+    built: true
+    description: "Excessive Daily Cash-Equivalent Deposits"
+    threshold_amount: 9000         # DRAFT - single-account daily aggregate, below CTR to stay non-obvious
+    window_days: 1
+    account_type_weight: {person: 1.0, company: 1.5}  # DRAFT
+  AML-ECT-CCE-OUT-A-D01-EAT:
+    built: true
+    description: "Excessive Daily Cash-Equivalent Withdrawals"
+    threshold_amount: 9000         # DRAFT
+    window_days: 1
+    account_type_weight: {person: 1.0, company: 1.5}  # DRAFT
+
+  # --- EOP: burst concentration to/from a single counterparty (deferred) ---
+  AML-EBB-IFT-ALL-A-D30-EOP:
+    built: false
+    description: "Burst In Beneficiary Activity (Long Period)"
+    threshold_amount: 25000       # DRAFT
+    window_days: 30
+  AML-EBB-IFT-ALL-P-D05-EOP:
+    built: false                  # party-group scope
+    description: "Burst in Beneficiary Activity in a Party Group (Short Period)"
+    threshold_amount: 15000       # DRAFT
+    window_days: 5
+  AML-EBO-IFT-ALL-A-D30-EOP:
+    built: false
+    description: "Burst In Originator Activity (Long Period)"
+    threshold_amount: 25000       # DRAFT
+    window_days: 30
+  AML-EBO-IFT-ALL-P-D05-EOP:
+    built: false                  # party-group scope
+    description: "Burst In Originator Activity in a Party Group (Short Period)"
+    threshold_amount: 15000       # DRAFT
+    window_days: 5
+
+  # --- EST: excessive single transaction (deferred) ---
+  AML-EFT-IFT-INN-A-S01-EST:
+    built: false
+    description: "Excessive Incoming High Risk Fund Transfers"
+    threshold_amount: 50000       # DRAFT - single-transaction amount
+  AML-EFT-IFT-OUT-A-S01-EST:
+    built: false
+    description: "Excessive Outgoing High Risk Fund Transfers"
+    threshold_amount: 50000       # DRAFT
+
+  # --- FTR: flow-through of funds (deferred - unresolved ratio question in workbook) ---
+  AML-FTF-ALL-ALL-A-D07-FTR:
+    built: false
+    description: "Flow Through of Funds (Long Period)"
+    window_days: 7
+    ratio_threshold_pct: 80       # DRAFT - unresolved in source workbook; in/out must be within this % of each other
+
+  # --- MBD: multiple branches, single account, single window ---
+  AML-MLB-ALL-INN-A-D05-MBD:
+    built: true
+    description: "Multiple Branches Deposits"
+    window_days: 5
+    min_branches: 3               # DRAFT - distinct branches (reuses atm_id/atm_location as branch identity)
+    min_deposit_amount: 1000      # DRAFT - per-deposit floor so it's not tripped by trivial amounts
+    account_type_weight: {person: 1.0, company: 1.5}  # DRAFT
+
+  # --- EXT: whitelist suppression, not a trigger ---
+  AML-EXT-ACT-KEY-A-LST-EXT:
+    built: false
+    description: "Filter Accounts On Accounts White List"
+    whitelist_file: watchlist/whitelist.csv

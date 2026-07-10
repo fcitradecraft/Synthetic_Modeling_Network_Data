@@ -6,8 +6,13 @@ from faker import Faker
 fake = Faker()
 
 def generate_uuid(length=12):
-    """Generate a short unique ID (default 12 characters)."""
-    return str(uuid.uuid4()).replace('-', '')[:length]
+    """Generate a short unique ID (default 12 characters).
+
+    Built off the stdlib random module (via random.getrandbits), not
+    uuid.uuid4() - uuid4 draws from os.urandom and ignores random.seed(),
+    which would silently break --seed reproducibility.
+    """
+    return uuid.UUID(int=random.getrandbits(128)).hex[:length]
 
 def parse_date(date_str):
     """Parse a date string like '2025-01-01' into a datetime object."""
@@ -55,6 +60,7 @@ def split_transaction(
     """Split a transaction into debit and credit entries."""
     known_accounts = known_accounts or set()
     rows = []
+    timestamp_date, timestamp_time = timestamp.split(" ", 1)
 
     src_known = src is not None and hasattr(src, "id") and src.id in known_accounts
     tgt_known = tgt is not None and hasattr(tgt, "id") and tgt.id in known_accounts
@@ -96,6 +102,8 @@ def split_transaction(
                     "transaction_id": txn_id,
                     "entry_id": txn_id + "-C",
                     "timestamp": timestamp,
+                    "date": timestamp_date,
+                    "time": timestamp_time,
                     "account_id": tgt.id,
                     "counterparty": placeholder_cp,
                     "amount": abs(amount),
@@ -119,9 +127,11 @@ def split_transaction(
                     "transaction_id": txn_id,
                     "entry_id": txn_id + "-D",
                     "timestamp": timestamp,
+                    "date": timestamp_date,
+                    "time": timestamp_time,
                     "account_id": src.id,
                     "counterparty": placeholder_cp,
-                    "amount": -abs(amount),
+                    "amount": abs(amount),
                     "direction": "debit",
                     "currency": currency,
                     "bank_name": src.bank_name,
@@ -141,9 +151,11 @@ def split_transaction(
                 "transaction_id": txn_id,
                 "entry_id": txn_id + "-D",
                 "timestamp": timestamp,
+                "date": timestamp_date,
+                "time": timestamp_time,
                 "account_id": src.id,
                 "counterparty": tgt.id if tgt else placeholder_cp,
-                "amount": -abs(amount),
+                "amount": abs(amount),
                 "direction": "debit",
                 "currency": currency,
                 "bank_name": src.bank_name,
@@ -161,6 +173,8 @@ def split_transaction(
                 "transaction_id": txn_id,
                 "entry_id": txn_id + "-C",
                 "timestamp": timestamp,
+                "date": timestamp_date,
+                "time": timestamp_time,
                 "account_id": tgt.id,
                 "counterparty": src.id if src else placeholder_cp,
                 "amount": abs(amount),
@@ -184,9 +198,11 @@ def split_transaction(
             "transaction_id": txn_id,
             "entry_id": txn_id + "-D",
             "timestamp": timestamp,
+            "date": timestamp_date,
+            "time": timestamp_time,
             "account_id": src.id,
             "counterparty": tgt.id,
-            "amount": -abs(amount),
+            "amount": abs(amount),
             "direction": "debit",
             "currency": currency,
             "bank_name": src.bank_name,
@@ -202,6 +218,8 @@ def split_transaction(
             "transaction_id": txn_id,
             "entry_id": txn_id + "-C",
             "timestamp": timestamp,
+            "date": timestamp_date,
+            "time": timestamp_time,
             "account_id": tgt.id,
             "counterparty": src.id if src else "",
             "amount": abs(amount),
@@ -246,9 +264,21 @@ def describe_transaction(payment_type, purpose=None):
     elif payment_type == "wire":
         return f"WIRE - {purpose} via {company} Bank"
     elif payment_type == "credit_card":
+        # Legacy token - superseded by the granular ccard/credit/debit/pos
+        # tokens below, kept only so old saved output/tests don't break.
         return f"CREDIT CARD - {purpose} charged to account at {company}"
     elif payment_type == "check":
         return f"CHECK - {purpose} written by {name}"
+    elif payment_type == "c_check":
+        return f"CASHIER'S CHECK - {purpose} issued to {name}"
+    elif payment_type == "p2p":
+        return f"P2P - {purpose} sent to {name}"
+    elif payment_type in ("ccard", "credit"):
+        return f"CREDIT CARD - {purpose} charged to account at {company}"
+    elif payment_type == "debit":
+        return f"DEBIT CARD - {purpose} charged to account at {company}"
+    elif payment_type == "pos":
+        return f"POS - {purpose} at {company} ({address})"
 
     return f"{payment_type.upper()} - {purpose or 'Transaction'}"
 

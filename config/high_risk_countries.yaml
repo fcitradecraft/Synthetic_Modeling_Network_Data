@@ -1,0 +1,12 @@
+# Reference list for the CTY rule (AML-TSD-EFT-ALL-A-S01-CTY).
+# Countries are real, public FATF-style high-risk/increased-monitoring
+# jurisdictions (standard practice in AML training - country risk
+# categories are regulatory data, not personal/entity identifiers).
+# Counterparty names/BICs generated against this list are fictional.
+countries:
+  - name: "Iran"
+    country_code: "IR"
+  - name: "North Korea"
+    country_code: "KP"
+  - name: "Myanmar"
+    country_code: "MM"
