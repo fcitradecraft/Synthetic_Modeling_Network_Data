@@ -1,0 +1,34 @@
+# Ordinary major US trading-partner countries - used for legitimate
+# (non-injected) international wire activity on IMPORT_EXPORT/
+# MANUFACTURING/WHOLESALE_DISTRIBUTION companies (see
+# generator/transactions.py's INTERNATIONAL_TRADE_ARCHETYPES). Kept
+# entirely separate from config/high_risk_countries.yaml - this list is
+# never used by inject_cty. Real countries, same rationale as
+# high_risk_countries.yaml's own comment: country codes are regulatory/
+# geographic reference data, not personal identifiers; counterparty
+# names/BICs generated against this list are fictional.
+countries:
+  - name: "Canada"
+    country_code: "CA"
+  - name: "Mexico"
+    country_code: "MX"
+  - name: "Germany"
+    country_code: "DE"
+  - name: "Japan"
+    country_code: "JP"
+  - name: "United Kingdom"
+    country_code: "GB"
+  - name: "China"
+    country_code: "CN"
+  - name: "South Korea"
+    country_code: "KR"
+  - name: "Netherlands"
+    country_code: "NL"
+  - name: "France"
+    country_code: "FR"
+  - name: "Vietnam"
+    country_code: "VN"
+  - name: "India"
+    country_code: "IN"
+  - name: "Brazil"
+    country_code: "BR"

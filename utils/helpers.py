@@ -3,6 +3,8 @@ import random
 from datetime import datetime, timedelta, date
 from faker import Faker
 
+from utils.logger import log
+
 fake = Faker()
 
 def generate_uuid(length=12):
@@ -18,11 +20,65 @@ def parse_date(date_str):
     """Parse a date string like '2025-01-01' into a datetime object."""
     return datetime.strptime(date_str, "%Y-%m-%d")
 
+def get_bent_type(name) -> str:
+    """Classify a BEnt record as 'atm' or 'branch' from its name string
+    (e.g. "Wells Farquod ATM 995123001" vs "...Branch 100059") - BEnt rows
+    have no dedicated type column, but the naming convention already
+    carries the distinction. Defaults to 'branch' (uncapped, unrounded,
+    over-the-counter wording) for anything that doesn't match, including
+    the generated-placeholder fallback used when a bank has no BEnt rows
+    at all."""
+    if not isinstance(name, str):
+        return "branch"
+    return "atm" if "atm" in name.lower() else "branch"
+
 def random_timestamp(start_date, end_date):
     """Generate a random timestamp between two datetime objects."""
     delta = end_date - start_date
     random_seconds = random.randint(0, int(delta.total_seconds()))
     return start_date + timedelta(seconds=random_seconds)
+
+# Real BICs this generator must never accidentally produce - duplicated
+# from validate.py's REAL_BIC_DENY_LIST (not imported, to avoid a circular
+# import - validate.py already imports from this module). Keep in sync by
+# hand if that list changes.
+_REAL_BIC_DENY_LIST = {"UPNBUS44", "VALLMTMT"}
+
+def generate_synthetic_bic(country_code: str = "US") -> str:
+    """Generate a fictitious but structurally-valid 8-character BIC/SWIFT
+    code (4-letter bank code + 2-letter country code, defaulting to 'US' +
+    2-character location code, all uppercase) - used for any wire
+    counterparty that isn't one of the 3 modeled banks (see
+    agents/agent_profiles.xlsx's swift_code column,
+    scripts/fix_bank_swift_codes.py). A real BIC's 5th-6th characters are
+    the country code, so an international counterparty should pass its own
+    (see config/trade_countries.yaml / config/high_risk_countries.yaml)
+    rather than leaving every synthetic BIC looking domestic."""
+    while True:
+        bank_code = "".join(random.choices("ABCDEFGHIJKLMNOPQRSTUVWXYZ", k=4))
+        location_code = "".join(random.choices("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", k=2))
+        bic = f"{bank_code}{country_code}{location_code}"
+        if bic not in _REAL_BIC_DENY_LIST:
+            return bic
+
+# Generic, plausible wire purposes (SWIFT MT103 Field 70/"Originator to
+# Beneficiary Information" equivalent) - deliberately one shared pool for
+# every wire regardless of is_laundering, so this field carries no
+# leakage tell on its own (a laundering-typology wire's stated purpose
+# looks exactly as mundane as a legitimate one - that's the nature of the
+# typology, not something to "fix" by making it sound suspicious).
+WIRE_PURPOSE_TEMPLATES = [
+    "Invoice settlement",
+    "Contract payment - professional services",
+    "Trade settlement",
+    "Funds transfer - business operations",
+    "Real estate closing costs",
+    "Vendor payment",
+    "Equipment purchase",
+    "Consulting services payment",
+    "Supply chain settlement",
+    "Investment funding transfer",
+]
 
 def safe_sample(population, k):
     """Safely sample k items from a list, even if the list is smaller than k."""
@@ -56,11 +112,24 @@ def split_transaction(
     post_date=None,
     atm_id=None,
     atm_location=None,
+    credit_timestamp=None,
+    credit_post_date=None,
 ):
-    """Split a transaction into debit and credit entries."""
+    """Split a transaction into debit and credit entries.
+
+    credit_timestamp/credit_post_date (optional) let the credit leg post on
+    a later date than the debit leg - a check's clearing float, where the
+    payer's account is debited on write/clear but the payee doesn't deposit
+    it (and it doesn't clear) until days later. Every other payment type
+    leaves these unset and both legs share the one timestamp/post_date, as
+    before.
+    """
     known_accounts = known_accounts or set()
     rows = []
     timestamp_date, timestamp_time = timestamp.split(" ", 1)
+    credit_ts = credit_timestamp if credit_timestamp else timestamp
+    credit_date, credit_time = credit_ts.split(" ", 1)
+    credit_pd = credit_post_date if credit_post_date else post_date
 
     src_known = src is not None and hasattr(src, "id") and src.id in known_accounts
     tgt_known = tgt is not None and hasattr(tgt, "id") and tgt.id in known_accounts
@@ -73,13 +142,89 @@ def split_transaction(
         else:
             tgt_name = fake.name()
 
-    credit_description = f"{payment_type.upper()} - {tgt_name}"
-    debit_description = f"{payment_type.upper()} - {tgt_name}"
+    # A caller-supplied source_description (e.g. describe_transaction's
+    # "Rent/Mortgage"/"Utility - Electricity"/"Restocking/Supplier") is
+    # more specific than anything this function can build from just the
+    # counterparty name, so it wins when provided. Previously this
+    # parameter was accepted but silently discarded - every non-cash
+    # transaction fell through to the generic templates below regardless
+    # of what a caller passed in.
+    if source_description:
+        credit_description = source_description
+        debit_description = source_description
+    else:
+        credit_description = f"{payment_type.upper()} - {tgt_name}"
+        debit_description = f"{payment_type.upper()} - {tgt_name}"
 
-    if payment_type.lower() == "ach" and src is not None and tgt is not None:
-        if src.owner_type == "Person" and tgt.owner_type in ["Company", "Merchant"]:
-            debit_description = f"ACH Transfer - {abs(amount):.2f} - {tgt_name}"
-            credit_description = f"ACH Transfer - {abs(amount):.2f} - {src_name}"
+    # ACH/check/cashier's check: always build from the real resolved
+    # src/tgt names, overriding any caller-supplied source_description -
+    # same precedent as cash below. An outgoing (debit) transfer should
+    # name who it was paid to, not restate who sent it; the incoming
+    # (credit) side should name who it came from. describe_transaction's
+    # own wording for these three used to fabricate an unrelated random
+    # name/company - this replaces that entirely. (ACH previously had a
+    # conditional version of this same idea guarded by "no caller-supplied
+    # description," but every real call site always supplies one, so that
+    # branch never actually ran - unconditional override, matching cash and
+    # check/c_check, is what actually takes effect.)
+    if payment_type.lower() in ("ach", "check", "c_check") and src is not None and tgt is not None:
+        label = {"ach": "ACH", "check": "CHECK", "c_check": "CASHIER'S CHECK"}[payment_type.lower()]
+        debit_description = f"{label} - Paid to {tgt_name}"
+        credit_description = f"{label} - Received from {src_name}"
+
+    # Wire-specific details (Rio's call, 2026-07-15): a standard Travel
+    # Rule compliance record (31 CFR 1010.410(f) - originator/beneficiary
+    # name, address, account, and the beneficiary's institution) plus a
+    # separate SWIFT MT103 Field 70-style "Originator to Beneficiary
+    # Information" purpose/remittance field. Both fields describe the
+    # whole transfer, not one leg, so both legs get the identical value -
+    # unlike check/ach's "Paid to/Received from" wording. The beneficiary-
+    # institution name here is best-effort: bank_name on a ProfileAccount
+    # is normally resolved later (post-generation, by main.py - see the
+    # bank-assignment fix), so it's usually not yet known at this point -
+    # falls back to "External Institution", same as the real Travel Rule's
+    # own "as many of the following items as are received" framing (not
+    # everything is always captured in practice either). swift_code
+    # itself (this row's own bank) is a separate main.py export-time
+    # field, not built here - see main.py's bank-resolution loop.
+    def _clean(val, default):
+        # A pandas NaN (float) is truthy in Python, so a plain "or" falls
+        # through it instead of the default - a NaN != itself is the
+        # standard NaN check without needing a pandas/math import here.
+        if val is None or val != val:
+            return default
+        val = str(val).strip()
+        return val if val and val.lower() != "nan" else default
+
+    travel_rule_info = None
+    originator_beneficiary_info = None
+    counterparty_country_code = None
+    if payment_type.lower() == "wire" and src is not None and tgt is not None:
+        src_id = src.id if hasattr(src, "id") else "N/A"
+        tgt_id = tgt.id if hasattr(tgt, "id") else "N/A"
+        src_address = _clean(getattr(src, "address", None), "Address on file")
+        tgt_address = _clean(getattr(tgt, "address", None), "Address on file")
+        tgt_institution = _clean(getattr(tgt, "bank_name", None), "External Institution")
+        # Whichever side carries an explicit (non-default) country_code is
+        # the transaction's country - set by inject_cty (high-risk) or the
+        # legitimate international-trade counterparties
+        # (generate_company_revenue_transactions/generate_restocking_
+        # transactions, gated on INTERNATIONAL_TRADE_ARCHETYPES). Defaults
+        # to "US" when neither side sets one - an ordinary domestic wire,
+        # not a blank field.
+        src_country = getattr(src, "country_code", None)
+        tgt_country = getattr(tgt, "country_code", None)
+        counterparty_country_code = (
+            tgt_country if tgt_country and tgt_country != "US"
+            else (src_country if src_country and src_country != "US" else "US")
+        )
+        tgt_bic = getattr(tgt, "swift_code", None) or generate_synthetic_bic(counterparty_country_code)
+        travel_rule_info = (
+            f"Originator: {src_name}, {src_address}, Acct {src_id} | "
+            f"Beneficiary: {tgt_name}, {tgt_address}, Acct {tgt_id}, "
+            f"Institution: {tgt_institution} ({tgt_bic})"
+        )
+        originator_beneficiary_info = random.choice(WIRE_PURPOSE_TEMPLATES)
 
     if payment_type.lower() == "cash":
         # Use provided ATM/BEnt metadata if available
@@ -90,8 +235,12 @@ def split_transaction(
             atm_address = fake.address().replace("\n", ", ")
             atm_location = f"{atm_name} ({atm_address})"
 
-        credit_description = f"CASH - Deposit at {atm_location}"
-        debit_description = f"CASH - Withdrawal at {atm_location}"
+        # ATM vs. over-the-counter (branch/teller) are mechanically
+        # different transactions, not just a different location - say so
+        # in the description. Rio's call, 2026-07-10.
+        cash_label = "ATM" if get_bent_type(atm_id) == "atm" else "CASH"
+        credit_description = f"{cash_label} - Deposit at {atm_location}"
+        debit_description = f"{cash_label} - Withdrawal at {atm_location}"
 
         placeholder_cp = "ATM"
 
@@ -201,7 +350,7 @@ def split_transaction(
             "date": timestamp_date,
             "time": timestamp_time,
             "account_id": src.id,
-            "counterparty": tgt.id,
+            "counterparty": tgt.id if tgt is not None else "",
             "amount": abs(amount),
             "direction": "debit",
             "currency": currency,
@@ -210,16 +359,19 @@ def split_transaction(
             "payment_type": payment_type,
             "is_laundering": is_laundering,
             "source_description": debit_description,
-            "post_date": post_date
+            "post_date": post_date,
+            "travel_rule_info": travel_rule_info,
+            "originator_beneficiary_info": originator_beneficiary_info,
+            "counterparty_country_code": counterparty_country_code,
         })
 
     if tgt_known:
         rows.append({
             "transaction_id": txn_id,
             "entry_id": txn_id + "-C",
-            "timestamp": timestamp,
-            "date": timestamp_date,
-            "time": timestamp_time,
+            "timestamp": credit_ts,
+            "date": credit_date,
+            "time": credit_time,
             "account_id": tgt.id,
             "counterparty": src.id if src else "",
             "amount": abs(amount),
@@ -230,12 +382,14 @@ def split_transaction(
             "payment_type": payment_type,
             "is_laundering": is_laundering,
             "source_description": credit_description,
-            "post_date": post_date
+            "post_date": credit_pd,
+            "travel_rule_info": travel_rule_info,
+            "originator_beneficiary_info": originator_beneficiary_info,
+            "counterparty_country_code": counterparty_country_code,
         })
 
-    print(f"[DEBUG] src: {src.id if src else 'CASH'}, tgt: {tgt.id if tgt else 'CASH'}, src_known: {src_known}, tgt_known: {tgt_known}")
     if not src_known and not tgt_known:
-        print(f"⚠️ Skipping txn {txn_id}: both accounts unknown")
+        log(f"Skipping txn {txn_id}: both accounts unknown", level="WARNING")
 
     return rows
 
@@ -257,20 +411,24 @@ def describe_transaction(payment_type, purpose=None):
     address = fake.address().replace("\n", ", ")
 
     if payment_type == "ach":
-        return f"ACH - {purpose} from {company} ({address})"
+        # Superseded by split_transaction's own leg-aware ACH wording (built
+        # from the real src/tgt names) - see split_transaction. This
+        # fallback only matters if describe_transaction is ever called from
+        # a path that doesn't route through split_transaction.
+        return f"ACH - {purpose}"
     elif payment_type == "cash":
         direction = "Deposit" if purpose == "Deposit" else "Withdrawal"
         return f"CASH - {direction} at {company} ATM ({address})"
     elif payment_type == "wire":
         return f"WIRE - {purpose} via {company} Bank"
-    elif payment_type == "credit_card":
-        # Legacy token - superseded by the granular ccard/credit/debit/pos
-        # tokens below, kept only so old saved output/tests don't break.
-        return f"CREDIT CARD - {purpose} charged to account at {company}"
     elif payment_type == "check":
-        return f"CHECK - {purpose} written by {name}"
+        # Superseded by split_transaction's own leg-aware check wording
+        # (built from the real src/tgt names) - this fallback only matters
+        # if describe_transaction is ever called from a path that doesn't
+        # route through split_transaction.
+        return f"CHECK - {purpose}"
     elif payment_type == "c_check":
-        return f"CASHIER'S CHECK - {purpose} issued to {name}"
+        return f"CASHIER'S CHECK - {purpose}"
     elif payment_type == "p2p":
         return f"P2P - {purpose} sent to {name}"
     elif payment_type in ("ccard", "credit"):

@@ -12,6 +12,27 @@
 
 review_date_range_days: 30  # analyst lookback window applied at review time, not generation time
 
+# Multi-rule alerts (Rio's call, 2026-07-10): real alerts aren't always one
+# account/one rule - overlapping behavior can trip more than one rule on
+# the same account within the same review period, and a real alert system
+# packages those together into a single alert rather than treating them as
+# independent cases. Deliberately a small, explicit, editable list of
+# plausible pairs, not "any rule with any rule" - both rules in a pair
+# must also be `built: true` to actually fire. Start small, iterate: add/
+# remove pairs and retune pair_probability as this gets validated against
+# real output, per Rio's explicit "don't fix it all at once" instruction.
+rule_overlaps:
+  pair_probability: 0.25  # DRAFT - of the flagged accounts, how many get a pair instead of a single rule
+  pairs:
+    # Structuring cash deposits also tripping the daily aggregate-deposit
+    # rule - same direction (INN), same tran_type (CCE), very plausible
+    # from the same underlying cash-heavy behavior.
+    - [AML-STR-CCE-INN-A-D01-DST, AML-ECT-CCE-INN-A-D01-EAT]
+    # A short-period ATM burst plausibly also pushes the monthly
+    # cumulative over its own threshold - same underlying heavy-ATM-use
+    # behavior, just two different window lengths on the same rule family.
+    - [AML-ATM-ATM-OUT-A-D05-EAT, AML-ATM-ATM-OUT-A-M01-EAT]
+
 rules:
   # --- CTY: single-transaction, reference-list-based ---
   AML-TSD-EFT-ALL-A-S01-CTY:
@@ -29,19 +50,23 @@ rules:
     built: true
     description: "Daily Cash-Equivalent Deposits Structuring"
     ctr_threshold: 10000          # regulatory (31 CFR 1010.311/.314)
-    deposit_min: 8200             # DRAFT - proposed structuring range
-    deposit_max: 9800             # DRAFT
-    window_days: 1
-    min_deposits: 2               # DRAFT - min pieces to aggregate above ctr_threshold in one day
+    deposit_min: 6500             # DRAFT - Rio's call, 2026-07-15: widened from 5500-10000
+    deposit_max: 9999              # DRAFT
+    window_days: 7                # spread window for repeated episodes (see min/max_episodes)
+    min_deposits: 2               # DRAFT - min pieces to aggregate above ctr_threshold in one episode/day
+    min_episodes: 3               # DRAFT - several distinct-day episodes per week, not just one
+    max_episodes: 5               # DRAFT
     account_type_weight: {person: 1.0, company: 1.5}  # DRAFT - cash-intensive businesses skew higher
   AML-STR-CCE-OUT-A-D01-DST:
     built: true
     description: "Daily Cash-Equivalent Withdrawals Structuring"
     ctr_threshold: 10000
-    withdrawal_min: 8200          # DRAFT
-    withdrawal_max: 9800          # DRAFT
-    window_days: 1
+    withdrawal_min: 6500          # DRAFT - Rio's call, 2026-07-15: widened from 5500-10000
+    withdrawal_max: 9999           # DRAFT
+    window_days: 7
     min_withdrawals: 2            # DRAFT
+    min_episodes: 3               # DRAFT
+    max_episodes: 5               # DRAFT
     account_type_weight: {person: 1.0, company: 1.5}  # DRAFT
 
   # --- EAT: excessive activity over a window, single account ---
@@ -50,18 +75,19 @@ rules:
     description: "Excessive Short Period ATM Withdrawals"
     threshold_amount: 3000        # DRAFT - aggregate ATM OUT over window_days
     window_days: 5
-    account_type_weight: {person: 2.0, company: 0.5}  # DRAFT - ATM cash reads far more naturally on a personal account
+    account_type_weight: {person: 0.67, company: 0.5}  # DRAFT - was person:2.0 (combined with M01, ~42% of all person selection weight vs ~21% for STR/ECT), brought to 1.0 2026-07-14; re-lowered to 0.67 2026-07-15 after adding the P-D05 variant below re-created the same imbalance across 3 variants instead of 2 (~23% vs ~15% for a 2-variant category) - see main.py account_type_weight comment
   AML-ATM-ATM-OUT-A-M01-EAT:
     built: true
     description: "Excessive Monthly ATM Withdrawals"
     threshold_amount: 8000        # DRAFT
     window_days: 30
-    account_type_weight: {person: 2.0, company: 0.5}  # DRAFT
+    account_type_weight: {person: 0.67, company: 0.5}  # DRAFT - see D05 above
   AML-ATM-ATM-OUT-P-D05-EAT:
-    built: false                  # party-group scope - deferred, needs party_id-aware dispatch
+    built: true                   # party-group scope - see main.py's accounts_by_party_id
     description: "Excessive Short Period ATM Withdrawals in Party Group"
     threshold_amount: 3000        # DRAFT
     window_days: 5
+    account_type_weight: {person: 0.67, company: 0.5}  # DRAFT - see D05 above; ATM now has 3 variants (D05/M01/P-D05), each at 0.67 so the category's combined person weight (2.0) matches the 2-variant STR/ECT baseline instead of running 1.5x it
   AML-ECT-CCE-INN-A-D01-EAT:
     built: true
     description: "Excessive Daily Cash-Equivalent Deposits"
@@ -75,44 +101,60 @@ rules:
     window_days: 1
     account_type_weight: {person: 1.0, company: 1.5}  # DRAFT
 
-  # --- EOP: burst concentration to/from a single counterparty (deferred) ---
+  # --- EOP: burst concentration to/from a single counterparty (international only - IFT) ---
   AML-EBB-IFT-ALL-A-D30-EOP:
-    built: false
+    built: true
     description: "Burst In Beneficiary Activity (Long Period)"
     threshold_amount: 25000       # DRAFT
     window_days: 30
+    piece_min: 1500                # DRAFT - per-wire piece range
+    piece_max: 8000                 # DRAFT
+    account_type_weight: {person: 0.5, company: 0.75}  # DRAFT - international IFT activity skews to business; company halved from 1.5 2026-07-15 - 4 EOP variants (EBB-A/P, EBO-A/P) at 1.5 each would combine to 6.0 (~29% of all company selection), nearly double the 2-variant STR/ECT baseline (3.0) for no reason tied to real-world weighting, just an unnormalized variant count
   AML-EBB-IFT-ALL-P-D05-EOP:
-    built: false                  # party-group scope
+    built: true                   # party-group scope - see main.py's accounts_by_party_id
     description: "Burst in Beneficiary Activity in a Party Group (Short Period)"
     threshold_amount: 15000       # DRAFT
     window_days: 5
+    piece_min: 1500                # DRAFT
+    piece_max: 8000                 # DRAFT
+    account_type_weight: {person: 0.5, company: 0.75}  # DRAFT - see EBB-A above (EOP company weight halved 2026-07-15 to un-multiply 4 variants)
   AML-EBO-IFT-ALL-A-D30-EOP:
-    built: false
+    built: true
     description: "Burst In Originator Activity (Long Period)"
     threshold_amount: 25000       # DRAFT
     window_days: 30
+    piece_min: 1500                # DRAFT
+    piece_max: 8000                 # DRAFT
+    account_type_weight: {person: 0.5, company: 0.75}  # DRAFT - see EBB-A above (EOP company weight halved 2026-07-15 to un-multiply 4 variants)
   AML-EBO-IFT-ALL-P-D05-EOP:
-    built: false                  # party-group scope
+    built: true                   # party-group scope
     description: "Burst In Originator Activity in a Party Group (Short Period)"
     threshold_amount: 15000       # DRAFT
     window_days: 5
+    piece_min: 1500                # DRAFT
+    piece_max: 8000                 # DRAFT
+    account_type_weight: {person: 0.5, company: 0.75}  # DRAFT - see EBB-A above (EOP company weight halved 2026-07-15 to un-multiply 4 variants)
 
-  # --- EST: excessive single transaction (deferred) ---
+  # --- EST: excessive single transaction ---
   AML-EFT-IFT-INN-A-S01-EST:
-    built: false
+    built: true
     description: "Excessive Incoming High Risk Fund Transfers"
-    threshold_amount: 50000       # DRAFT - single-transaction amount
+    threshold_amount: 50000       # DRAFT - single-transaction floor, segment/size-aware above it
+    account_type_weight: {person: 0.7, company: 1.3}  # DRAFT - both plausible; company skews slightly higher
   AML-EFT-IFT-OUT-A-S01-EST:
-    built: false
+    built: true
     description: "Excessive Outgoing High Risk Fund Transfers"
     threshold_amount: 50000       # DRAFT
+    account_type_weight: {person: 0.7, company: 1.3}  # DRAFT
 
-  # --- FTR: flow-through of funds (deferred - unresolved ratio question in workbook) ---
+  # --- FTR: flow-through of funds ---
   AML-FTF-ALL-ALL-A-D07-FTR:
-    built: false
+    built: true
     description: "Flow Through of Funds (Long Period)"
     window_days: 7
-    ratio_threshold_pct: 80       # DRAFT - unresolved in source workbook; in/out must be within this % of each other
+    threshold_amount: 20000       # DRAFT - minimum "large volume" of flow-through
+    ratio_threshold_pct: 90       # Rio's call, 2026-07-15: in/out must be within 90% of each other
+    account_type_weight: {person: 1.0, company: 1.2}  # DRAFT
 
   # --- MBD: multiple branches, single account, single window ---
   AML-MLB-ALL-INN-A-D05-MBD:

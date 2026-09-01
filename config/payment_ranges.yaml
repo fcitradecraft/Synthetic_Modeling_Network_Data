@@ -40,14 +40,16 @@ person_segment_matrix:
 # formula - 11 of 34 companies have no naics_description populated (known
 # pre-existing gap, see project memory), so a formula can't cover all 34.
 # Classified by hand from name + naics_description where present.
+#
+# Expanded 2026-07-10 from 3 broad buckets (retail/F&B, manufacturing,
+# professional) into 11 finer industry archetypes - Rio's call: a
+# restaurant's restocking rhythm looks nothing like a gas station's or a
+# real estate office's, so one "consumer-facing retail" bucket was too
+# coarse for realistic overhead/revenue-mix modeling (see
+# config/transaction_categories.yaml and the rent/utilities/restocking/
+# revenue_mix tables below).
 company_segments:
-  C1:  # consumer-facing retail / food & beverage - cash+POS heavy, high frequency, small ticket
-    - COMP1010  # Sahara - General Merchandise Retailers
-    - COMP1011  # Great Gas - Gasoline Stations and Fuel Dealers
-    - COMP1012  # Dinoco - Gasoline Stations and Fuel Dealers
-    - COMP1013  # Couture Designs - Clothing Retailers
-    - COMP1014  # Brittany's - Clothing Retailers
-    - COMP1015  # Couture Designs - Clothing Retailers
+  RESTAURANT:  # cash+card heavy revenue, frequent perishable restocking
     - COMP1022  # Mackeys - Food Services and Drinking Places
     - COMP1026  # The Melange Lounge LLC
     - COMP1027  # Arrakis Cantina & Bar
@@ -55,7 +57,15 @@ company_segments:
     - COMP1031  # Bene Gesserit Bistro
     - COMP1032  # Kwisatz Kitchen Inc
     - COMP1034  # Chani's Kitchen & Catering
-  C2:  # manufacturing / wholesale - B2B ACH/wire/check, larger ticket, lower frequency, near-zero cash
+  RETAIL:  # card+cash revenue, periodic inventory restocking
+    - COMP1010  # Sahara - General Merchandise Retailers
+    - COMP1013  # Couture Designs - Clothing Retailers
+    - COMP1014  # Brittany's - Clothing Retailers
+    - COMP1015  # Couture Designs - Clothing Retailers
+  GAS_STATION:  # high-volume cash+card, frequent fuel restocking
+    - COMP1011  # Great Gas
+    - COMP1012  # Dinoco
+  MANUFACTURING:  # B2B ACH/wire/check only, near-zero cash, raw-material restocking
     - COMP1023  # Trailers by Tom - Motor Home Manufacturing
     - COMP1001  # Charmont Paper Products
     - COMP1003  # Renewal by Gerald - Compost Manufacturing
@@ -64,20 +74,26 @@ company_segments:
     - COMP1006  # Marcus Furniture
     - COMP1007  # Rio Titan - Gold/Silver Ore Mining
     - COMP1009  # Generators and Trasformers Inc
-  C3:  # professional / real estate / trade / finance - wire+check dominant, invoice-driven
+  PROFESSIONAL_SERVICES:  # check/ACH/wire, office lease, no restocking
     - COMP1002  # Hopkins, Branch and Flores - Business Associations
-    - COMP1008  # Seaside Dock Management - Marinas
-    - COMP1016  # Speedee Delivery
-    - COMP1017  # Mr. Delivery
-    - COMP1018  # Grilli and Gallegos - Funds, Trusts and Other Financial Vehicles
+  REAL_ESTATE:  # wire-heavy (closings/commissions), office lease, no restocking
     - COMP1019  # Golden Key Realtors
     - COMP1020  # KW Homes
-    - COMP1021  # Office Waste Retrieval
+  DELIVERY_LOGISTICS:  # ACH/check service revenue + P2P tips, vehicle/fuel overhead
+    - COMP1016  # Speedee Delivery
+    - COMP1017  # Mr. Delivery
+  FINANCIAL_SERVICES:  # wire/check dominant, minimal cash/card, no restocking
+    - COMP1018  # Grilli and Gallegos - Funds, Trusts and Other Financial Vehicles
     - COMP1024  # TADECO LLC - fbo F. Markos Trust
-    - COMP1025  # Spice Flow GmbH - US Operations
-    - COMP1029  # Fremen Food Distributors LLC
-    - COMP1030  # Dune Imports & Exports Inc
     - COMP1033  # Corrino Capital Partners
+  IMPORT_EXPORT:  # large wire-heavy international trade, bulk inventory restocking
+    - COMP1025  # Spice Flow GmbH - US Operations
+    - COMP1030  # Dune Imports & Exports Inc
+  WHOLESALE_DISTRIBUTION:  # B2B ACH/check, bulk restocking, warehouse lease
+    - COMP1029  # Fremen Food Distributors LLC
+  FACILITY_SERVICES:  # ACH/check service contracts, vehicle/equipment overhead
+    - COMP1021  # Office Waste Retrieval
+    - COMP1008  # Seaside Dock Management - Marinas
 
 # ---------------------------------------------------------------------------
 # ORDINARY-SPENDING RANGES (the type/amount consistency fix)
@@ -94,6 +110,41 @@ company_segments:
 # 2026-07-10, not consolidated into one "card" type, even though their
 # ranges below are close - they're separately editable if real behavior
 # diverges later (e.g. credit skewing to larger/revolving purchases).
+# Sanity ceiling on a merchant's average_expense before it drives a
+# purchase amount in generate_profile_transactions' merchant-purchase loop.
+# Backstop against bad data (e.g. a merchant row with a five/six-figure
+# "average" walk-in purchase) rather than a realism tune - $10,000 sits
+# comfortably above the highest legitimate values already in the roster
+# (Couture Designs tops out at $8,000, Cottage Designs at $6,000).
+max_merchant_average_expense: 10000
+
+# CHECK CLEARING FLOAT - days between the debit leg (payer writes/clears)
+# and the credit leg (payee deposits it), layered on top of
+# generate_post_date's existing 0-3-business-day posting lag. A cashier's
+# check is bank-guaranteed and tied to a near-term purpose, so it moves
+# faster than a personal/business check. DRAFT ranges, 2026-07-11.
+check_clearing_float:
+  check:   [2, 10]
+  c_check: [1, 5]
+
+# SIZE-TIERED WIRE/CHECK RANGES (companies only) - business SIZE drives a
+# wire or check's realistic range, not industry: a small business's wire
+# floor is lower than a large one's, regardless of archetype. Size tier
+# comes from a company's own transaction_scaler
+# (get_company_size_tier, generator/transactions.py) - small <=0.75,
+# mid <=1.5, large otherwise. Replaces the wire/check entries that used
+# to live inside each archetype's payment_type_ranges.companies below.
+# Rio's call, 2026-07-14 - DRAFT values, his to retune.
+size_tiered_payment_ranges:
+  wire:
+    small: [2000, 15000]
+    mid:   [8000, 150000]
+    large: [8000, 5000000]  # ceiling raised 2026-07-15 (Rio's call): "larger businesses might send more than $2,000,000"
+  check:
+    small: [1000, 10000]
+    mid:   [2500, 40000]
+    large: [5000, 99999]
+
 payment_type_ranges:
   persons:
     P1: {p2p: [10, 90],   ccard: [8, 90],  credit: [8, 100], debit: [8, 80],  pos: [8, 90],  wire: [1000, 5000],  check: [50, 500],   c_check: [500, 3000],  ach: [50, 3000],   cash: [40, 130]}
@@ -102,16 +153,193 @@ payment_type_ranges:
     P4: {p2p: [15, 150],  ccard: [10, 150],credit: [10, 180],debit: [10, 130],pos: [10, 150],wire: [1500, 8000],  check: [75, 1000],  c_check: [750, 5000],  ach: [75, 5000],   cash: [60, 170]}
     P5: {p2p: [20, 200],  ccard: [15, 500],credit: [15, 600],debit: [15, 300],pos: [15, 500],wire: [3000, 25000], check: [150, 2500], c_check: [1500, 10000],ach: [150, 10000], cash: [80, 200]}
     P6: {p2p: [20, 200],  ccard: [15, 500],credit: [15, 600],debit: [15, 300],pos: [15, 500],wire: [2500, 9000],  check: [150, 2500], c_check: [1500, 10000],ach: [150, 9000],  cash: [80, 200]}
+  # RESTAURANT/RETAIL/GAS_STATION ranges widened 2026-07-10: these
+  # companies' actual average_expense values (populated by
+  # scripts/recalibrate_transaction_volume.py) run $300-$5,800 per
+  # company - a company-level average, not a single walk-in customer's
+  # ticket - and vary widely company-to-company within an archetype. A
+  # narrow cash/card band meant most individual companies' amount range
+  # only overlapped one or two rails at all, so revenue_mix_weights had
+  # nothing left to weight among. Widened cash/card to both span most of
+  # that per-company range, so amount-eligibility doesn't silently
+  # override the weights for a typical company.
+  # RESTAURANT/RETAIL/GAS_STATION card/cash ranges shrunk 2026-07-14 to real
+  # per-ticket scale (Fed/consumer-payments research: restaurant card
+  # transactions average $29-34, general retail ~$81) - these now describe
+  # an individual customer sale, since generate_daily_card_settlement
+  # aggregates them into daily batch-deposit lines before they hit the
+  # ledger (see that function's docstring). wire/check here are now only
+  # consulted by non-revenue paths (a company paying a merchant, etc.) -
+  # revenue itself draws wire/check amounts from size_tiered_payment_ranges
+  # above instead (Rio's call, 2026-07-14: size drives wire/check, not
+  # archetype).
   companies:
-    C1: {ccard: [8, 60],   credit: [8, 80],   debit: [8, 50],   pos: [8, 60],   cash: [500, 1500], ach: [200, 3000],  check: [200, 3000],  c_check: [1000, 8000],  wire: [1000, 15000],  p2p: [10, 200]}
-    C2: {ccard: [0, 0],    credit: [0, 0],    debit: [0, 0],    pos: [0, 0],    cash: [0, 0],      ach: [500, 10000], check: [500, 10000], c_check: [1000, 15000], wire: [2000, 25000],  p2p: [0, 0]}
-    C3: {ccard: [20, 200], credit: [20, 250], debit: [20, 150], pos: [20, 200], cash: [0, 500],    ach: [300, 5000],  check: [300, 5000],  c_check: [1500, 15000], wire: [2000, 50000],  p2p: [0, 0]}
+    RESTAURANT:             {ccard: [8, 90],   credit: [8, 100],  debit: [8, 80],   pos: [8, 90],   cash: [5, 90],     ach: [500, 3000],  check: [500, 3000],  c_check: [1000, 6000],  wire: [8000, 150000], p2p: [10, 80]}
+    RETAIL:                 {ccard: [8, 150],  credit: [8, 180],  debit: [8, 120],  pos: [8, 150],  cash: [5, 80],     ach: [500, 3000],  check: [500, 3000],  c_check: [1000, 8000],  wire: [8000, 150000], p2p: [10, 60]}
+    GAS_STATION:             {ccard: [8, 60],   credit: [8, 70],   debit: [8, 55],   pos: [8, 55],   cash: [5, 50],     ach: [200, 5000],  check: [200, 5000],  c_check: [1500, 10000], wire: [8000, 150000], p2p: [0, 0]}
+    MANUFACTURING:           {ccard: [0, 0],    credit: [0, 0],    debit: [0, 0],    pos: [0, 0],    cash: [0, 0],      ach: [500, 10000], check: [500, 10000], c_check: [1000, 15000], wire: [2000, 25000],  p2p: [0, 0]}
+    PROFESSIONAL_SERVICES:   {ccard: [20, 200], credit: [20, 250], debit: [20, 150], pos: [20, 200], cash: [0, 200],    ach: [300, 5000],  check: [300, 5000],  c_check: [1500, 15000], wire: [2000, 30000],  p2p: [0, 0]}
+    REAL_ESTATE:             {ccard: [0, 100],  credit: [0, 100],  debit: [0, 100],  pos: [0, 100],  cash: [0, 200],    ach: [300, 5000],  check: [500, 10000], c_check: [2000, 20000], wire: [3000, 50000],  p2p: [0, 0]}
+    DELIVERY_LOGISTICS:      {ccard: [10, 100], credit: [10, 100], debit: [10, 80],  pos: [10, 100], cash: [100, 800],  ach: [300, 3000],  check: [300, 3000],  c_check: [1000, 6000],  wire: [1000, 10000],  p2p: [10, 150]}
+    FINANCIAL_SERVICES:      {ccard: [0, 0],    credit: [0, 0],    debit: [0, 0],    pos: [0, 0],    cash: [0, 100],    ach: [500, 8000],  check: [500, 10000], c_check: [2000, 20000], wire: [5000, 100000], p2p: [0, 0]}
+    IMPORT_EXPORT:           {ccard: [0, 0],    credit: [0, 0],    debit: [0, 0],    pos: [0, 0],    cash: [0, 0],      ach: [500, 5000],  check: [1000, 10000],c_check: [2000, 20000], wire: [5000, 75000],  p2p: [0, 0]}
+    WHOLESALE_DISTRIBUTION:  {ccard: [0, 50],   credit: [0, 50],   debit: [0, 50],   pos: [0, 50],   cash: [0, 300],    ach: [500, 8000],  check: [500, 8000],  c_check: [1500, 15000], wire: [2000, 25000],  p2p: [0, 0]}
+    FACILITY_SERVICES:       {ccard: [0, 50],   credit: [0, 50],   debit: [0, 50],   pos: [0, 50],   cash: [0, 300],    ach: [300, 3000],  check: [300, 3000],  c_check: [1000, 6000],  wire: [1000, 10000],  p2p: [0, 0]}
 
-# [0, 0] means "not realistic for this segment" - a manufacturing company
-# (C2) taking cash or P2P, or a professional-services firm (C3) taking P2P,
-# is exactly the kind of mismatch an investigator should be able to flag.
-# The filter treats [0, 0] as "excludes this type even if accepted_payment_methods
+# [0, 0] means "not realistic for this segment" - a MANUFACTURING company
+# taking cash or P2P, or a FINANCIAL_SERVICES firm taking P2P, is exactly
+# the kind of mismatch an investigator should be able to flag. The filter
+# treats [0, 0] as "excludes this type even if accepted_payment_methods
 # lists it" rather than silently allowing a $0 transaction.
+
+# ---------------------------------------------------------------------------
+# REVENUE-MIX WEIGHTS (by company archetype)
+# ---------------------------------------------------------------------------
+# Used by generate_company_revenue_transactions in place of a uniform
+# random pick among amount-eligible payment types - a restaurant's revenue
+# genuinely skews toward card+cash, a real estate office's toward wire.
+# Weights only need to be proportional to each other (normalized over
+# whichever subset is still amount-eligible at generation time), not sum
+# to exactly 1. Archetypes with no restocking (PROFESSIONAL_SERVICES,
+# REAL_ESTATE, FINANCIAL_SERVICES) still receive revenue, just no COGS
+# outflow - see restocking_pct_of_revenue below.
+# RESTAURANT/RETAIL/GAS_STATION cash weight lowered 2026-07-10: these
+# archetypes now also get a dedicated weekly bulk OTC till deposit
+# (business_cash_deposit_weekly below), so the per-transaction cash entry
+# here is the occasional smaller cash sale that didn't make it into the
+# till sweep, not the primary cash channel - keeping the old weight would
+# double-count the same till cash twice.
+revenue_mix_weights:
+  # RESTAURANT/RETAIL ach/check dropped to near-zero 2026-07-14 - Nacha/Fed
+  # research confirms ACH is overwhelmingly payroll/bill-pay/B2B vendor
+  # settlement, not a rail a walk-in customer pays their tab on; check is
+  # a rare catering/private-event invoice at most, not routine revenue. A
+  # kept-but-tiny weight (not zero) still allows that rare case to occur.
+  # Card/debit/pos are generated as aggregated daily settlement deposits,
+  # not per-sale (see DAILY_SETTLEMENT_ARCHETYPES, generator/transactions.py).
+  RESTAURANT:              {ccard: 0.34, debit: 0.32, pos: 0.24, cash: 0.09, ach: 0.005, check: 0.005}
+  RETAIL:                  {ccard: 0.39, debit: 0.30, pos: 0.22, cash: 0.08, ach: 0.005, check: 0.005}
+  GAS_STATION:              {ccard: 0.45, debit: 0.35, pos: 0.12, cash: 0.08}
+  MANUFACTURING:            {ach: 0.45, check: 0.30, wire: 0.20, c_check: 0.05}
+  PROFESSIONAL_SERVICES:    {ach: 0.35, check: 0.35, wire: 0.15, ccard: 0.15}
+  REAL_ESTATE:              {wire: 0.55, check: 0.30, ach: 0.15}
+  DELIVERY_LOGISTICS:       {ach: 0.35, check: 0.20, p2p: 0.20, cash: 0.15, ccard: 0.10}
+  FINANCIAL_SERVICES:       {wire: 0.55, check: 0.30, ach: 0.15}
+  IMPORT_EXPORT:            {wire: 0.65, check: 0.25, ach: 0.10}
+  WHOLESALE_DISTRIBUTION:   {ach: 0.45, check: 0.35, wire: 0.20}
+  FACILITY_SERVICES:        {ach: 0.45, check: 0.40, ccard: 0.15}
+
+# ---------------------------------------------------------------------------
+# EXPENSE-MIX WEIGHTS (persons, P1-P6) - person analog to revenue_mix_weights
+# above. Used by generate_profile_transactions' merchant-purchase loop so
+# payment_type isn't picked uniformly at random among every amount-eligible
+# accepted method - real people overwhelmingly pay everyday purchases by
+# card/cash, rarely by check. c_check is deliberately omitted (excluded from
+# the weighted pool entirely) - a cashier's check for a routine purchase
+# isn't realistic; that's covered by the dedicated c_check_gl_purchase
+# mechanic instead. DRAFT weights, 2026-07-11.
+# ---------------------------------------------------------------------------
+expense_mix_weights:
+  P1: {ccard: 0.20, credit: 0.10, debit: 0.30, pos: 0.15, cash: 0.15, ach: 0.05, check: 0.03, p2p: 0.02}
+  P2: {ccard: 0.20, credit: 0.10, debit: 0.30, pos: 0.15, cash: 0.15, ach: 0.05, check: 0.03, p2p: 0.02}
+  P3: {ccard: 0.25, credit: 0.15, debit: 0.28, pos: 0.12, cash: 0.10, ach: 0.06, check: 0.03, p2p: 0.01}
+  P4: {ccard: 0.25, credit: 0.15, debit: 0.28, pos: 0.12, cash: 0.10, ach: 0.06, check: 0.03, p2p: 0.01}
+  P5: {ccard: 0.30, credit: 0.20, debit: 0.22, pos: 0.10, cash: 0.08, ach: 0.06, check: 0.03, p2p: 0.01}
+  P6: {ccard: 0.30, credit: 0.20, debit: 0.22, pos: 0.10, cash: 0.08, ach: 0.06, check: 0.03, p2p: 0.01}
+
+# ---------------------------------------------------------------------------
+# RENT/MORTGAGE (dedicated function, fixed_recurring - see
+# config/transaction_categories.yaml). Drawn once per profile, same
+# amount and same day-of-month every period. Company amounts are a base
+# range multiplied by the company's own transaction_scaler, same pattern
+# as average_expense.
+# ---------------------------------------------------------------------------
+rent_monthly:
+  persons:
+    P1: [700, 1000]
+    P2: [700, 1000]
+    P3: [1100, 1600]
+    P4: [1100, 1600]
+    P5: [1800, 3000]
+    P6: [1800, 3000]
+  companies:
+    RESTAURANT:             [2500, 6000]
+    RETAIL:                 [2000, 5000]
+    GAS_STATION:             [3000, 7000]
+    MANUFACTURING:           [4000, 12000]
+    PROFESSIONAL_SERVICES:   [1500, 4000]
+    REAL_ESTATE:             [1500, 4000]
+    DELIVERY_LOGISTICS:      [1500, 4000]
+    FINANCIAL_SERVICES:      [2000, 6000]
+    IMPORT_EXPORT:           [2500, 7000]
+    WHOLESALE_DISTRIBUTION:  [3000, 8000]
+    FACILITY_SERVICES:       [1500, 4000]
+
+# rent_payment_mix - drawn once per payer, reused every month (same
+# per-payer-fixed-habit mechanic as the rent amount/day-of-month). Persons
+# skew heavily ach (autopay/portal); commercial leases stay more check-heavy.
+# DRAFT ratios, 2026-07-11.
+rent_payment_mix:
+  persons:   {ach: 0.75, check: 0.25}
+  companies: {ach: 0.55, check: 0.45}
+
+# ---------------------------------------------------------------------------
+# UTILITIES (dedicated function, variable_recurring - see
+# config/transaction_categories.yaml). Three separate monthly bills
+# (electricity, phone, internet), each with its own small variance around
+# a fixed-per-profile baseline - genuinely separate billers in real life,
+# not one lump sum. Company amounts scale by transaction_scaler.
+# ---------------------------------------------------------------------------
+utilities_monthly:
+  persons:
+    P1: {electricity: [60, 120],  phone: [40, 70],  internet: [50, 80]}
+    P2: {electricity: [60, 120],  phone: [40, 70],  internet: [50, 80]}
+    P3: {electricity: [90, 180],  phone: [45, 80],  internet: [55, 90]}
+    P4: {electricity: [90, 180],  phone: [45, 80],  internet: [55, 90]}
+    P5: {electricity: [150, 300], phone: [50, 90],  internet: [60, 100]}
+    P6: {electricity: [150, 300], phone: [50, 90],  internet: [60, 100]}
+  companies:
+    RESTAURANT:              {electricity: [600, 1500], phone: [80, 200], internet: [100, 300]}
+    RETAIL:                  {electricity: [300, 700],  phone: [60, 150], internet: [80, 200]}
+    GAS_STATION:              {electricity: [800, 2000], phone: [80, 200], internet: [80, 200]}
+    MANUFACTURING:            {electricity: [1800, 5500],phone: [100, 250],internet: [100, 300]}
+    PROFESSIONAL_SERVICES:    {electricity: [150, 400],  phone: [50, 120], internet: [60, 150]}
+    REAL_ESTATE:              {electricity: [150, 350],  phone: [50, 120], internet: [60, 150]}
+    DELIVERY_LOGISTICS:       {electricity: [150, 400],  phone: [80, 200], internet: [60, 150]}
+    FINANCIAL_SERVICES:       {electricity: [250, 550],  phone: [60, 150], internet: [80, 200]}
+    IMPORT_EXPORT:            {electricity: [400, 900],  phone: [80, 200], internet: [100, 250]}
+    WHOLESALE_DISTRIBUTION:   {electricity: [500, 1200], phone: [80, 200], internet: [100, 250]}
+    FACILITY_SERVICES:        {electricity: [250, 700],  phone: [60, 150], internet: [80, 200]}
+
+# ---------------------------------------------------------------------------
+# RESTOCKING / COGS (companies only, variable_recurring - see
+# config/transaction_categories.yaml). Sized as a percentage of the
+# company's own revenue_monthly_target, frequency/rail set per archetype
+# in generate_restocking_transactions(). Archetypes with no meaningful
+# COGS (pure service/finance/real-estate businesses) are omitted entirely
+# rather than given a 0% entry - they just don't get a restocking channel.
+# ---------------------------------------------------------------------------
+restocking_pct_of_revenue:
+  RESTAURANT:              {pct: [0.28, 0.35], frequency: weekly,   payment_types: [ach, check]}
+  RETAIL:                  {pct: [0.40, 0.55], frequency: biweekly, payment_types: [ach, wire, check]}
+  GAS_STATION:              {pct: [0.75, 0.85], frequency: weekly,   payment_types: [ach, wire]}
+  MANUFACTURING:            {pct: [0.45, 0.60], frequency: monthly,  payment_types: [ach, wire, check]}
+  DELIVERY_LOGISTICS:       {pct: [0.10, 0.20], frequency: biweekly, payment_types: [ach, check]}
+  IMPORT_EXPORT:            {pct: [0.55, 0.70], frequency: monthly,  payment_types: [wire, check]}
+  WHOLESALE_DISTRIBUTION:   {pct: [0.60, 0.75], frequency: biweekly, payment_types: [ach, wire, check]}
+  FACILITY_SERVICES:        {pct: [0.10, 0.20], frequency: monthly,  payment_types: [ach, check]}
+
+# ---------------------------------------------------------------------------
+# OWNER DISTRIBUTIONS (companies with an `owners` cell only - see
+# scripts/assign_business_ownership.py, ~18 of 34 companies). Modest
+# monthly draw as a percentage of actual monthly revenue in dollars
+# (revenue_monthly_target x average_expense, same math restocking uses),
+# split across joint owners by their ownership pct, paid from the company
+# to each owner's personal account. Additional to, not instead of,
+# whatever salary or self-employment income an owner already has - an
+# owner-operator commonly draws both. DRAFT percentage, Rio's review.
+# ---------------------------------------------------------------------------
+owner_distribution_pct_of_revenue: [0.05, 0.15]
 
 # ---------------------------------------------------------------------------
 # PAYROLL (dedicated function - not the accepted-methods filter above)
@@ -147,3 +375,89 @@ client_payment:
 # pattern. Modeled as a periodic distribution rather than a paycheck.
 unearned_income:
   P6: {amount: [2500, 9000], frequency: monthly, payment_types: [ach, wire]}
+
+# ---------------------------------------------------------------------------
+# ATM MECHANICS (per-account daily cap, by person segment)
+# ---------------------------------------------------------------------------
+# Real ATMs dispense in $20 multiples (no change) and cap daily withdrawals.
+# Applied only to cash withdrawals sourced from a BEnt whose name identifies
+# it as an ATM (vs a branch/teller) - see get_bent_type() in transactions.py.
+# Branch/teller cash is exact-amount and uncapped; once an account's ATM
+# cap is hit for the day, further cash need for that day routes to a
+# branch/teller withdrawal instead. DRAFT - reasonable estimates, not tied
+# to any specific bank's actual limits.
+atm_daily_limit:
+  P1: 300
+  P2: 300
+  P3: 500
+  P4: 500
+  P5: 800
+  P6: 800
+
+# ---------------------------------------------------------------------------
+# BUSINESS OTC CASH (companies only, cash-heavy archetypes only). Weekly
+# bulk till/register deposit (the accumulated cash from a week of sales
+# going to the bank) and a smaller, separate weekly withdrawal to restock
+# the register with change - both always over-the-counter/branch, never
+# ATM (see get_bent_type() / choose_cash_withdrawal() in transactions.py).
+# Deposit is sized as a percentage of the company's own target monthly
+# revenue (revenue_monthly_target x average_expense) rather than a flat
+# dollar range - retuned 2026-07-14, since the flat range (scaled by
+# transaction_scaler) had drifted to represent an unrealistic ~48% cash
+# share once real revenue targets were established. Percentages reflect
+# FFIEC cash-intensive-business guidance: gas stations/convenience stores
+# are the most cash-intensive of the three, restaurants/retail lower and
+# increasingly card-dominant. DRAFT, Rio's to retune.
+# ---------------------------------------------------------------------------
+business_cash_deposit_pct_of_revenue:
+  RESTAURANT:   [0.10, 0.12]
+  RETAIL:       [0.08, 0.10]
+  GAS_STATION:  [0.18, 0.20]
+
+business_cash_withdrawal_weekly:
+  RESTAURANT:   [150, 500]
+  RETAIL:       [150, 400]
+  GAS_STATION:  [150, 400]
+
+# ---------------------------------------------------------------------------
+# LARGE PERSONAL OTC WITHDRAWAL (persons only) - an occasional, one-off
+# large cash withdrawal from savings for a big purchase (e.g. a used car),
+# not tied to any specific merchant purchase - a real bank statement shows
+# the withdrawal, not what the cash was later spent on. Always
+# branch-sourced (well beyond any ATM daily cap anyway). At most one per
+# person per run. DRAFT, Rio's call 2026-07-10.
+# ---------------------------------------------------------------------------
+large_personal_withdrawal:
+  probability: 0.12
+  amount:
+    P1: [2000, 6000]
+    P2: [2000, 6000]
+    P3: [3000, 10000]
+    P4: [3000, 10000]
+    P5: [5000, 25000]
+    P6: [5000, 25000]
+
+# ---------------------------------------------------------------------------
+# CASHIER'S CHECK VIA CASH-WITHDRAWAL-INTO-GL (persons only) - legitimate,
+# not a laundering typology. Models the real teller mechanic where buying a
+# cashier's check runs through the bank as a cash withdrawal from the
+# customer's account (the visible, potentially cash-monitoring-triggering
+# leg) funding a deposit into the bank's own cashier's-check GL/suspense
+# account (the offsetting record, see
+# generator/transactions.py::generate_c_check_gl_transactions). This is a
+# real false-positive pattern: the withdrawal alone can look like ordinary
+# structuring/excessive-cash activity until the offsetting c_check is
+# found - exactly the "alert clearing" skill the exercise trains. At most
+# one per person per run, same teller visit (no clearing float - that's for
+# checks moving between two external parties). DRAFT, Rio's call
+# 2026-07-11.
+# ---------------------------------------------------------------------------
+c_check_gl_purchase:
+  probability: 0.10
+  amount:
+    P1: [500, 3000]
+    P2: [500, 3000]
+    P3: [750, 5000]
+    P4: [750, 5000]
+    P5: [1500, 10000]
+    P6: [1500, 10000]

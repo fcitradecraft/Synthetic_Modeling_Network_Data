@@ -1,0 +1,116 @@
+# Named transaction categories and their behavior model. This is the
+# "what kind of recurring activity exists and how does it behave" layer;
+# the actual calibrated numbers per person-segment (P1-P6) or company-
+# archetype live in config/payment_ranges.yaml, keyed by the same names
+# used here. Extends the existing merchant_patterns/merchant_frequency
+# (NAICS-code) mechanism rather than replacing it - Rio's call 2026-07-10.
+#
+# regularity values:
+#   fixed_recurring        - same amount, same schedule, every period
+#                             (rent/mortgage, payroll)
+#   variable_recurring      - regular schedule, amount varies within a
+#                             band (utilities, restocking, groceries)
+#   variable_discretionary  - irregular schedule AND amount (gas, travel,
+#                             hobbies, self-employment client payments)
+#   mechanically_constrained - governed by hardware/dispensing rules, not
+#                             a spending pattern (ATM cash)
+
+categories:
+  payroll:
+    applies_to: [person]
+    regularity: fixed_recurring
+    mechanism: dedicated_function
+    numbers: payment_ranges.yaml#payroll_biweekly
+    note: >
+      Amount drawn once per employee, reused every pay period - see
+      Phase 1a fix, 2026-07-10.
+
+  self_employment_income:
+    applies_to: [person]
+    regularity: variable_discretionary
+    mechanism: dedicated_function
+    numbers: payment_ranges.yaml#client_payment
+    note: Irregular client/customer payments in place of a paycheck.
+
+  unearned_income:
+    applies_to: [person]
+    regularity: variable_recurring
+    mechanism: dedicated_function
+    numbers: payment_ranges.yaml#unearned_income
+    note: Periodic distribution (trust/investment/rental) for P6 only.
+
+  rent_or_mortgage:
+    applies_to: [person, company]
+    regularity: fixed_recurring
+    mechanism: dedicated_function
+    numbers: payment_ranges.yaml#rent_monthly
+    payment_types: [ach, check]
+    note: >
+      Drawn once per profile, same amount and day-of-month every period,
+      to a synthesized landlord/lender counterparty.
+
+  utilities:
+    applies_to: [person, company]
+    regularity: variable_recurring
+    mechanism: dedicated_function
+    numbers: payment_ranges.yaml#utilities_monthly
+    payment_types: [ach]
+    note: >
+      Three separate monthly bills (electricity, phone, internet), each
+      its own line item - genuinely separate billers, not one lump sum.
+
+  restocking_cogs:
+    applies_to: [company]
+    regularity: variable_recurring
+    mechanism: dedicated_function
+    numbers: payment_ranges.yaml#restocking_pct_of_revenue
+    note: >
+      Sized as a percentage of revenue_monthly_target; frequency and rail
+      set per archetype. Omitted entirely for pure-service archetypes
+      (PROFESSIONAL_SERVICES, REAL_ESTATE, FINANCIAL_SERVICES) - no
+      meaningful COGS.
+
+  pos_revenue_mix:
+    applies_to: [company]
+    regularity: variable_discretionary
+    mechanism: existing_function_reweighted
+    numbers: payment_ranges.yaml#revenue_mix_weights
+    note: >
+      generate_company_revenue_transactions's payment-type choice, now
+      weighted by archetype instead of uniform-random among amount-
+      eligible rails.
+
+  groceries:
+    applies_to: [person]
+    regularity: variable_recurring
+    mechanism: merchant_patterns
+    note: Unchanged - already NAICS-matched, weekly-ish frequency.
+
+  gas:
+    applies_to: [person]
+    regularity: variable_recurring
+    mechanism: merchant_patterns
+    note: Unchanged - already NAICS-matched, weekly-ish frequency.
+
+  travel_hobbies:
+    applies_to: [person]
+    regularity: variable_discretionary
+    mechanism: merchant_patterns
+    note: Unchanged - whatever else a person's merchant_patterns covers.
+
+  atm_cash:
+    applies_to: [person, company]
+    regularity: mechanically_constrained
+    mechanism: dedicated_function
+    numbers: payment_ranges.yaml#atm_daily_limit
+    note: >
+      $20-multiple withdrawals, capped per account per day by segment -
+      see choose_cash_withdrawal() in generator/transactions.py.
+
+  teller_cash:
+    applies_to: [person, company]
+    regularity: variable_discretionary
+    mechanism: dedicated_function
+    note: >
+      Branch/teller cash - exact amount, uncapped. Mechanically distinct
+      from ATM cash, not just a different location.

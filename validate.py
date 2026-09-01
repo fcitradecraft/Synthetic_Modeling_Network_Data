@@ -1,16 +1,23 @@
 """
-Pre-export validation gate. Runs 12 checks against the assembled transaction
+Pre-export validation gate. Runs 15 checks against the assembled transaction
 set before any file is written; on any hard FAIL, nothing gets exported.
 
-Gates 3, 8, 9, 11 return SKIP rather than PASS/FAIL: they depend on fields
-(running_balance, swift_code-on-exported-rows) that don't exist in the
-current schema yet. SKIP is reported explicitly so the report never silently
-drops a gate - it's a "not yet applicable", not a pass.
+Gates 3 and 13 (running_balance_reconciliation, no_negative_running_balance)
+return SKIP rather than PASS/FAIL: they depend on a running_balance field
+that doesn't exist in the current schema yet. bic_length/bic_not_real_
+institution (gates 10-11) also SKIP, but only in the edge case of a run with
+zero wire transactions at all - swift_code is now propagated onto wire rows
+(2026-07-15), so a normal run with any wire activity actually runs these
+instead of skipping. person_card_direction (gate 8) PASSes vacuously if no
+person_account_ids are supplied (run_all_checks's caller doesn't have to
+know the roster). SKIP/vacuous-PASS is reported explicitly so the report
+never silently drops a gate - it's a "not yet applicable", not a pass.
 
-Gate 12 (leakage) returns WARN rather than FAIL and does not block export -
-see check_leakage's docstring. Every other gate is a real correctness bug
-(duplicate IDs, unbalanced legs, a date before it was possible, etc.) and
-still hard-blocks on FAIL.
+Gate 14 (leakage) and Gate 15 (clearing_float_gap) can return WARN rather
+than FAIL and do not block export on that path - see check_leakage's and
+check_clearing_float_gap's docstrings. Every other gate is a real
+correctness bug (duplicate IDs, unbalanced legs, a date before it was
+possible, etc.) and still hard-blocks on FAIL.
 """
 import argparse
 import sys
@@ -120,6 +127,61 @@ def check_field_blank_by_row_type(df: pd.DataFrame) -> ValidationResult:
     )
 
 
+def check_person_card_direction(df: pd.DataFrame, person_account_ids: frozenset = frozenset()) -> ValidationResult:
+    """Gate: ccard/credit/debit/pos rows on a person account must always
+    be direction == 'debit' - a person's card activity is always an
+    outgoing purchase, never incoming/credit (that's a company's revenue
+    - see generate_daily_card_settlement/generate_company_revenue_
+    transactions in generator/transactions.py). Locked in as an enforced
+    invariant per Rio's call, 2026-07-15 - audited every person-income
+    path (payroll, self-employment client_payment, unearned_income, owner
+    distributions) and confirmed none currently violate this, so this
+    gate is guarding against future regression, not fixing an active bug.
+
+    Needs to know which accounts are persons - validate.py otherwise never
+    cross-references agents/agent_profiles.xlsx, so main.py passes this in
+    (built the same way it already builds known_accounts_set). Defaults to
+    an empty set, in which case this gate can't find any person rows to
+    check and PASSes vacuously - same tradeoff every schema-dependent gate
+    already accepts (e.g. bic_length when swift_code doesn't exist yet).
+    """
+    if not person_account_ids:
+        return ValidationResult("person_card_direction", "PASS", "no person_account_ids provided - nothing to check")
+    is_person = df["account_id"].astype(str).isin(person_account_ids)
+    is_card = df["payment_type"].isin(["ccard", "credit", "debit", "pos"])
+    bad = df[is_person & is_card & (df["direction"] != "debit")]
+    if bad.empty:
+        return ValidationResult(
+            "person_card_direction", "PASS",
+            "all person ccard/credit/debit/pos rows are direction == debit"
+        )
+    return ValidationResult(
+        "person_card_direction", "FAIL",
+        f"{len(bad)} person ccard/credit/debit/pos rows are credit, not debit, e.g. entry_id {bad['entry_id'].head(5).tolist()}"
+    )
+
+
+def check_wire_details_by_row_type(df: pd.DataFrame) -> ValidationResult:
+    """Gate: swift_code/travel_rule_info/originator_beneficiary_info/
+    counterparty_country_code populated iff payment_type == 'wire'
+    (utils/helpers.py's split_transaction wire block, main.py's
+    swift_code resolution)."""
+    is_wire = df["payment_type"] == "wire"
+    wire_fields = ["swift_code", "travel_rule_info", "originator_beneficiary_info", "counterparty_country_code"]
+    missing_on_wire = df[is_wire & df[wire_fields].isna().any(axis=1)]
+    present_off_wire = df[~is_wire & df[wire_fields].notna().any(axis=1)]
+    bad = pd.concat([missing_on_wire, present_off_wire])
+    if bad.empty:
+        return ValidationResult(
+            "wire_details_by_row_type", "PASS",
+            "swift_code/travel_rule_info/originator_beneficiary_info populated iff payment_type == wire"
+        )
+    return ValidationResult(
+        "wire_details_by_row_type", "FAIL",
+        f"{len(missing_on_wire)} wire rows missing a wire-detail field, {len(present_off_wire)} non-wire rows with one set"
+    )
+
+
 def check_bic_length(df: pd.DataFrame) -> ValidationResult:
     """Gate 8: any BIC/SWIFT code must be 8 or 11 characters. SKIP - swift_code not propagated to exported rows yet."""
     if "swift_code" not in df.columns:
@@ -211,9 +273,35 @@ def check_leakage(df: pd.DataFrame, label_col: str = "is_laundering",
     # leakage is advisory now, not a hard block (see print_report), so a
     # human reviewing the report is the actual backstop for that class of
     # bug going forward, not this automated check.
+    # 'in_package' is exempt for the same reason as 'account_id': the
+    # injected/flagged rows are by construction always in_package='y' (the
+    # rule injectors only ever target the sampled customer roster), so it
+    # carries the same identity signal as account_id itself, not new
+    # information - see main.py's in_package comment, Rio's call
+    # 2026-07-10.
+    # 'travel_rule_info' and 'originator_beneficiary_info' (wire-only,
+    # 2026-07-15) are exempt for the same reason as 'source_description':
+    # they carry identity/description information (the same names/
+    # addresses/accounts already visible elsewhere in the row), not
+    # incidental signal. originator_beneficiary_info is also deliberately
+    # drawn from one shared purpose-template pool regardless of
+    # is_laundering (see utils/helpers.py's WIRE_PURPOSE_TEMPLATES), so it
+    # shouldn't leak even without this exemption - explicit is safer than
+    # relying on the cardinality threshold alone.
+    # 'counterparty_country_code' is exempt for the same reason as
+    # 'payment_type'/'date': the CTY rule (AML-TSD-EFT-ALL-A-S01-CTY) is
+    # *defined* around specific high-risk-country codes - a wire to Iran/
+    # North Korea/Myanmar correlating with that rule is the evidentiary
+    # signature investigators are meant to notice, not incidental leakage.
+    # 2026-07-15's legitimate international wires (IMPORT_EXPORT/
+    # MANUFACTURING/WHOLESALE_DISTRIBUTION, see INTERNATIONAL_TRADE_
+    # ARCHETYPES) draw from a disjoint, ordinary-country list specifically
+    # so "wire to any foreign country" isn't itself a leak - only the
+    # specific high-risk codes are meant to stay predictive.
     exempt = {
         label_col, "transaction_id", "entry_id", "account_id", "counterparty", "owner_name", "source_description",
-        "rule_id", "typology", "role_in_typology", "difficulty", "date", "payment_type",
+        "rule_id", "typology", "role_in_typology", "difficulty", "date", "payment_type", "in_package",
+        "travel_rule_info", "originator_beneficiary_info", "counterparty_country_code",
     }
     leaks = []
 
@@ -246,7 +334,55 @@ def check_leakage(df: pd.DataFrame, label_col: str = "is_laundering",
     return ValidationResult("leakage", "WARN", f"{len(leaks)} leaking column/value pairs, e.g. {detail}")
 
 
-def run_all_checks(df: pd.DataFrame, start_date: str, end_date: str) -> list[ValidationResult]:
+def check_clearing_float_gap(df: pd.DataFrame, start_date: str, end_date: str,
+                              max_gap_days: int = 30) -> ValidationResult:
+    """Gate 13: a check/c_check's credit leg must post on or after its debit
+    leg, within a sane window (utils/helpers.py split_transaction's
+    credit_timestamp/credit_post_date - see
+    generator/transactions.py::compute_check_clearing_dates).
+
+    Only transaction_id groups with 2+ legs are checked - a single-leg
+    check (the counterparty wasn't a known account) has nothing to compare
+    against. FAILs on a negative gap (credit before debit - the invariant
+    itself is broken) or an unreasonably large one (a config/generation
+    bug, not a realistic float). WARNs, doesn't FAIL, if either leg lands
+    outside [start_date, end_date] - a check written near the end of the
+    exercise window can realistically clear a few days past it; that's a
+    human call, not a hard block, same rationale as check_leakage.
+    """
+    checks = df[df["payment_type"].str.lower().isin(["check", "c_check"])]
+    counts = checks.groupby("transaction_id").size()
+    paired_ids = counts[counts >= 2].index
+    if len(paired_ids) == 0:
+        return ValidationResult("clearing_float_gap", "PASS", "no paired check/c_check transactions to check")
+
+    paired = checks[checks["transaction_id"].isin(paired_ids)]
+    ts = pd.to_datetime(paired["timestamp"])
+    debit_ts = ts[paired["direction"] == "debit"].groupby(paired["transaction_id"]).min()
+    credit_ts = ts[paired["direction"] == "credit"].groupby(paired["transaction_id"]).min()
+    gap_days = (credit_ts - debit_ts).dt.total_seconds() / 86400
+
+    bad_gap = gap_days[(gap_days < 0) | (gap_days > max_gap_days)]
+    if not bad_gap.empty:
+        return ValidationResult(
+            "clearing_float_gap", "FAIL",
+            f"{len(bad_gap)} check/c_check transactions have a negative or >{max_gap_days}-day "
+            f"gap between debit and credit legs, e.g. {bad_gap.index[:5].tolist()}"
+        )
+
+    out_of_range = paired[(ts < pd.Timestamp(start_date)) | (ts > pd.Timestamp(end_date))]
+    if not out_of_range.empty:
+        return ValidationResult(
+            "clearing_float_gap", "WARN",
+            f"{out_of_range['transaction_id'].nunique()} check/c_check transactions have a leg "
+            f"outside [{start_date}, {end_date}] - realistic float overflow near the window edge"
+        )
+
+    return ValidationResult("clearing_float_gap", "PASS", "all check/c_check debit/credit gaps are non-negative and bounded")
+
+
+def run_all_checks(df: pd.DataFrame, start_date: str, end_date: str,
+                    person_account_ids: frozenset = frozenset()) -> list[ValidationResult]:
     return [
         check_duplicate_entry_id(df),
         check_debit_credit_balance(df),
@@ -255,11 +391,14 @@ def run_all_checks(df: pd.DataFrame, start_date: str, end_date: str) -> list[Val
         check_post_date_business_day(df),
         check_post_date_after_timestamp(df),
         check_field_blank_by_row_type(df),
+        check_person_card_direction(df, person_account_ids),
+        check_wire_details_by_row_type(df),
         check_bic_length(df),
         check_bic_not_real_institution(df),
         check_injected_rows_within_date_range(df, start_date, end_date),
         check_no_negative_running_balance(df),
         check_leakage(df),
+        check_clearing_float_gap(df, start_date, end_date),
     ]
 
 
