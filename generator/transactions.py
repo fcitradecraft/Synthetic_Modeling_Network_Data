@@ -102,6 +102,22 @@ def get_company_size_tier(transaction_scaler) -> str:
     return "large"
 
 
+def draw_opening_balance(owner_type: str, segment, transaction_scaler) -> float:
+    """Segment-aware (persons) / size-tier-aware (companies) opening
+    balance draw for the internal ledger (generator/ledger.py) - same
+    pattern as every other amount table in this file. `segment` is None
+    for companies, `transaction_scaler` is None for persons, matching how
+    ProfileAccount's .segment/.transaction_scaler attributes are already
+    set (see main.py)."""
+    ranges = PAYMENT_RANGES["opening_balance_ranges"]
+    if str(owner_type).lower() == "person":
+        lo, hi = ranges["persons"].get(segment, ranges["persons"]["P3"])
+    else:
+        tier = get_company_size_tier(transaction_scaler)
+        lo, hi = ranges["companies"][tier]
+    return round(random.uniform(lo, hi), 2)
+
+
 def get_company_owners(owners_str) -> list[tuple[str, float]]:
     """Parse a company's `owners` cell ("PERS1002:60,PERS1008:40") into
     [(person_entity_id, pct), ...]. Returns [] for an unowned company
@@ -202,14 +218,15 @@ def choose_cash_withdrawal(payer_acct, payer_bank, bents_by_bank, amount, segmen
     """Pick a withdrawal source (ATM or branch/teller) and the resulting
     amount for a cash-paying purchase of ``amount``.
 
-    Real ATMs dispense in $20 multiples (no change) and cap daily
-    withdrawals per account; branch/teller cash is exact-amount and
+    Real ATMs dispense in fixed-denomination multiples (no change) and cap
+    daily withdrawals per account; branch/teller cash is exact-amount and
     uncapped - a mechanically different transaction, not just a different
-    location. Rounds up to the next $20 so the withdrawal always covers at
-    least the purchase price. If that would exceed the account's daily ATM
-    cap for ``date_key`` (config/payment_ranges.yaml's atm_daily_limit,
-    keyed by P1-P6 person segment), the withdrawal routes to a branch/
-    teller instead - uncapped, and left at the original exact amount.
+    location. Rounds up to the next denomination (config/payment_ranges.
+    yaml's atm_denomination) so the withdrawal always covers at least the
+    purchase price. If that would exceed the account's daily ATM cap for
+    ``date_key`` (config/payment_ranges.yaml's atm_daily_limit, keyed by
+    P1-P6 person segment), the withdrawal routes to a branch/teller
+    instead - uncapped, and left at the original exact amount.
 
     Returns (final_amount, bent_id, bent_location).
     """
@@ -224,7 +241,8 @@ def choose_cash_withdrawal(payer_acct, payer_bank, bents_by_bank, amount, segmen
         return generate_uuid(8), fake.address().replace("\n", ", ")
 
     daily_cap = PAYMENT_RANGES["atm_daily_limit"].get(segment) if segment else None
-    rounded = math.ceil(amount / 20) * 20 if amount > 0 else 0
+    denomination = PAYMENT_RANGES["atm_denomination"]
+    rounded = math.ceil(amount / denomination) * denomination if amount > 0 else 0
 
     if atm_bents and daily_cap is not None:
         key = (payer_acct.id, date_key)
@@ -326,11 +344,19 @@ def maybe_internationalize_wire_counterparty(counterparty, segment: str, payment
     are always businesses, never individuals. No-op (returns counterparty
     unchanged) for every other archetype/payment_type - this exists so
     genuine international wire activity isn't limited to the injected CTY
-    typology (Rio's call, 2026-07-15)."""
+    typology (Rio's call, 2026-07-15).
+
+    Also reassigns .id to a fresh uuid whenever it does internationalize -
+    2026-09-02: some callers (e.g. generate_restocking_transactions) now
+    pass in a persistent, known, domestically-banked pool account. A real
+    international counterparty wouldn't bank domestically, so it needs a
+    genuinely separate, untracked identity rather than inheriting the
+    pooled account's id and (incorrectly) resolving to a domestic bank."""
     intl_share = INTERNATIONAL_TRADE_ARCHETYPES.get(segment)
     if payment_type.lower() != "wire" or not intl_share or random.random() >= intl_share:
         return counterparty
     country = random.choice(TRADE_COUNTRIES)
+    counterparty.id = generate_uuid()
     counterparty.owner_type = "Company"
     counterparty.owner_name = f"{fake.company()} ({country['name']})"
     counterparty.address = f"{fake.street_address()}, {country['name']}"
@@ -339,8 +365,33 @@ def maybe_internationalize_wire_counterparty(counterparty, segment: str, payment
     return counterparty
 
 
+def _draw_pool_counterparty(pool: pd.DataFrame) -> "ProfileAccount":
+    """Draw one persistent counterparty from a pre-generated pool
+    (landlord/utility_provider/supplier/card_processor -
+    scripts/add_counterparty_pools.py) - a real, bank-homed,
+    ledger-tracked account instead of a disposable fake identity, so
+    "everyone banks somewhere" (Rio's call, 2026-09-02). The drawn
+    account_number is already present in profile_df (these pools are
+    "never sampled down" the same way merchants are - see main.py's
+    non_customer_rows), so it's automatically part of known_accounts and
+    correctly resolves to its home bank downstream - no extra wiring
+    needed here. Falls back to a disposable fake identity only if the
+    pool is unexpectedly empty, rather than crashing."""
+    if pool.empty:
+        return ProfileAccount(
+            id=generate_uuid(), owner_id=generate_uuid(8), owner_type="Company",
+            owner_name=fake.company(), address=fake.address().replace("\n", ", "),
+        )
+    row = random.choice(pool.to_dict("records"))
+    return ProfileAccount(
+        id=row["account_number"], owner_id=row["entity_id"], owner_type="Company",
+        owner_name=row["name"], address=row["address"],
+    )
+
+
 def generate_daily_card_settlement(
     companies_df: pd.DataFrame,
+    card_processor_pool: pd.DataFrame,
     known_accounts: set,
     register,
     start_dt: datetime,
@@ -400,6 +451,12 @@ def generate_daily_card_settlement(
             owner_name=company.get("name", ""),
             address=company.get("address", "")
         )
+        # One card processor per company, reused across every settlement
+        # deposit - previously fabricated a brand-new identity every single
+        # transaction (finer-grained than even daily), which was more an
+        # oversight than an intentional design; a business doesn't get a
+        # new payment processor every batch.
+        card_processor = _draw_pool_counterparty(card_processor_pool)
 
         business_days = get_business_days(start_dt, end_dt)
         if not business_days:
@@ -428,17 +485,10 @@ def generate_daily_card_settlement(
                 timestamp = ts_dt.strftime("%Y-%m-%d %H:%M:%S")
                 post_date = generate_post_date(ts_dt).strftime("%Y-%m-%d %H:%M:%S")
 
-                counterparty = ProfileAccount(
-                    id=generate_uuid(),
-                    owner_id=generate_uuid(8),
-                    owner_type="Company",
-                    owner_name=f"{fake.company()} Card Processing",
-                    address=fake.address().replace("\n", ", ")
-                )
                 entries = split_transaction(
                     txn_id=generate_uuid(),
                     timestamp=timestamp,
-                    src=counterparty,
+                    src=card_processor,
                     tgt=comp_acct,
                     amount=amount,
                     currency="USD",
@@ -454,6 +504,7 @@ def generate_daily_card_settlement(
 
 def generate_company_revenue_transactions(
     companies_df: pd.DataFrame,
+    revenue_customer_pool: pd.DataFrame,
     bents_by_bank: dict,
     known_accounts: set,
     register,
@@ -463,20 +514,26 @@ def generate_company_revenue_transactions(
     months_in_range: float,
 ) -> None:
     """Generate incoming revenue transactions (card/ACH/check/cash receipts)
-    for company accounts from synthesized, non-tracked counterparties.
+    for company accounts from a bounded, per-company pool of recurring
+    customers (scripts/add_customer_pools.py) - real, bank-homed, ledger-
+    tracked accounts, drawn from repeatedly (not one fresh fake identity
+    per transaction) - Checkpoint 3 of the "coherent virtual banking
+    world" work, 2026-09-02. Each company's pool is scoped to that company
+    alone (owner_entity_id) - the same customer recurring identically
+    across unrelated companies would be its own realism problem.
 
     Companies previously had no incoming-transaction mechanism at all -
     accepted_payment_methods/average_expense/revenue_monthly_target are
-    populated by scripts/recalibrate_transaction_volume.py. The synthesized
-    counterparty is deliberately not a known account (same pattern
-    generator/rule_injectors.py's inject_cty uses) so split_transaction
-    emits only the credit leg on the company's own account, matching how a
-    real bank statement shows revenue from untracked external payers.
+    populated by scripts/recalibrate_transaction_volume.py.
     """
     for _, company in companies_df.iterrows():
         revenue_target = company.get("revenue_monthly_target")
         if pd.isna(revenue_target):
             continue
+
+        company_customer_pool = revenue_customer_pool[
+            revenue_customer_pool["owner_entity_id"] == company["entity_id"]
+        ]
 
         comp_acct_id = company.get("account_number")
         if pd.isna(comp_acct_id):
@@ -537,6 +594,23 @@ def generate_company_revenue_transactions(
         weight_fraction = sum(per_txn_weights.values()) if per_txn_weights else 1.0
         num_txns = max(1, int(round(float(revenue_target) * months_in_range * weight_fraction)))
 
+        # Total dollars this residual channel should produce across the
+        # whole date range, split evenly across num_txns - each amount is
+        # sized around this target (+/-30%, same variance convention
+        # generate_daily_card_settlement already uses) rather than an
+        # independent uniform draw from the rail's full range. Low-
+        # frequency B2B revenue (wire/check-heavy archetypes) can be as
+        # few as 1-3 transactions for a whole quarter; an independent
+        # full-range draw at that count has too much variance to reliably
+        # approach the intended monthly_revenue_dollars total (e.g. 2
+        # draws from an $8,000-$5,000,000 wire range could land anywhere)
+        # - found 2026-09-01 diagnosing why several B2B companies' actual
+        # revenue came in far below their calibrated target. The rail's
+        # own range is still respected as a floor/ceiling clamp, just not
+        # the primary distribution shape.
+        channel_target_total = float(revenue_target) * avg_rev * weight_fraction * months_in_range
+        target_per_txn = channel_target_total / num_txns
+
         for _ in range(num_txns):
             # 2026-07-14: payment_type is now chosen FIRST (weighted
             # directly from revenue_mix_weights, unconditioned on any
@@ -569,7 +643,7 @@ def generate_company_revenue_transactions(
                     lo, hi = PAYMENT_RANGES["size_tiered_payment_ranges"][payment_type][size_tier]
                 else:
                     lo, hi = archetype_ranges.get(payment_type, (avg_rev * 0.7, avg_rev * 1.3))
-                amount = round(random.uniform(lo, hi), 2)
+                amount = round(min(max(target_per_txn * random.uniform(0.7, 1.3), lo), hi), 2)
             else:
                 amount = round(random.uniform(avg_rev * 0.7, avg_rev * 1.3), 2)
                 payment_type = pick_payment_type_for_amount(
@@ -624,14 +698,7 @@ def generate_company_revenue_transactions(
                 if not register(entries):
                     return
             else:
-                counterparty_type = random.choice(["Person", "Company"])
-                counterparty = ProfileAccount(
-                    id=generate_uuid(),
-                    owner_id=generate_uuid(8),
-                    owner_type=counterparty_type,
-                    owner_name=fake.name() if counterparty_type == "Person" else fake.company(),
-                    address=fake.address().replace("\n", ", ")
-                )
+                counterparty = _draw_pool_counterparty(company_customer_pool)
                 counterparty = maybe_internationalize_wire_counterparty(counterparty, company_segment, payment_type)
                 credit_timestamp = credit_post_date = None
                 if payment_type.lower() in ("check", "c_check"):
@@ -682,11 +749,21 @@ def generate_self_employment_income_transactions(
     get a periodic distribution instead - confirmed by Rio 2026-07-10 as
     explained unearned income (trust/investment/rental), not deliberately
     unexplained wealth.
+
+    Client/distributor counterparties are drawn from a bounded, per-person
+    pool (scripts/add_customer_pools.py, Checkpoint 3 of the "coherent
+    virtual banking world" work, 2026-09-02) - real, bank-homed, ledger-
+    tracked accounts scoped to this person alone (owner_entity_id), not
+    shared with any other self-employed person's pool.
     """
     no_employer = profile_df[(profile_df["type"] == "person") & profile_df["employer"].isna()]
+    self_employment_client_pool = profile_df[profile_df["type"] == "self_employment_client"]
 
     for _, person in no_employer.iterrows():
         segment = get_person_segment(person.get("income_level"), person.get("employment_status"))
+        person_client_pool = self_employment_client_pool[
+            self_employment_client_pool["owner_entity_id"] == person["entity_id"]
+        ]
 
         if segment in PAYMENT_RANGES["client_payment"]:
             spec = PAYMENT_RANGES["client_payment"][segment]
@@ -750,13 +827,7 @@ def generate_self_employment_income_transactions(
                     atm_location=bent_loc,
                 )
             else:
-                counterparty = ProfileAccount(
-                    id=generate_uuid(),
-                    owner_id=generate_uuid(8),
-                    owner_type="Company",
-                    owner_name=fake.company(),
-                    address=fake.address().replace("\n", ", ")
-                )
+                counterparty = _draw_pool_counterparty(person_client_pool)
                 purpose = "Client Payment" if segment in PAYMENT_RANGES["client_payment"] else "Distribution"
                 credit_timestamp = credit_post_date = None
                 if payment_type.lower() in ("check", "c_check"):
@@ -792,10 +863,12 @@ def generate_rent_transactions(
     """Fixed monthly rent/mortgage for every sampled person and company -
     config/transaction_categories.yaml's fixed_recurring category. Amount
     and day-of-month are each drawn once per profile and reused every
-    period, to a synthesized landlord/lender counterparty (same untracked-
-    counterparty pattern as company revenue and self-employment income).
+    period, to a landlord drawn from the persistent pool
+    (scripts/add_counterparty_pools.py) and reused across that payer's
+    whole rent history - a real, bank-homed, ledger-tracked account.
     """
     payers = profile_df[profile_df["type"].isin(["person", "company"])]
+    landlord_pool = profile_df[profile_df["type"] == "landlord"]
     rent_table = PAYMENT_RANGES["rent_monthly"]
 
     for _, payer in payers.iterrows():
@@ -825,13 +898,7 @@ def generate_rent_transactions(
             owner_name=payer.get("name", ""),
             address=payer.get("address", "")
         )
-        landlord = ProfileAccount(
-            id=generate_uuid(),
-            owner_id=generate_uuid(8),
-            owner_type="Company",
-            owner_name=fake.company(),
-            address=fake.address().replace("\n", ", ")
-        )
+        landlord = _draw_pool_counterparty(landlord_pool)
         rent_mix = PAYMENT_RANGES["rent_payment_mix"]["persons" if is_person else "companies"]
         payment_type = random.choices(list(rent_mix.keys()), weights=list(rent_mix.values()), k=1)[0]
 
@@ -878,9 +945,12 @@ def generate_utilities_transactions(
     and company - three separate line items, each with its own fixed
     per-profile baseline and small month-to-month variance
     (variable_recurring, config/transaction_categories.yaml), paid to a
-    synthesized utility-provider counterparty.
+    provider drawn from the persistent pool (scripts/add_counterparty_
+    pools.py) - one draw per bill type per payer, reused across that
+    bill's whole payment history.
     """
     payers = profile_df[profile_df["type"].isin(["person", "company"])]
+    utility_pool = profile_df[profile_df["type"] == "utility_provider"]
     util_table = PAYMENT_RANGES["utilities_monthly"]
 
     for _, payer in payers.iterrows():
@@ -910,13 +980,7 @@ def generate_utilities_transactions(
         for bill_name, bill_range in bills.items():
             baseline = random.uniform(bill_range[0], bill_range[1]) * scaler
             day_of_month = random.randint(1, 28)
-            provider = ProfileAccount(
-                id=generate_uuid(),
-                owner_id=generate_uuid(8),
-                owner_type="Company",
-                owner_name=fake.company(),
-                address=fake.address().replace("\n", ", ")
-            )
+            provider = _draw_pool_counterparty(utility_pool)
 
             for due in get_monthly_dates(start_dt, end_dt, day_of_month):
                 amount = round(baseline * random.uniform(0.85, 1.15), 2)
@@ -945,6 +1009,7 @@ def generate_utilities_transactions(
 
 def generate_restocking_transactions(
     companies_df: pd.DataFrame,
+    supplier_pool: pd.DataFrame,
     known_accounts: set,
     register,
     start_dt: datetime,
@@ -955,10 +1020,11 @@ def generate_restocking_transactions(
     meaningful cost of goods sold (config/payment_ranges.yaml's
     restocking_pct_of_revenue) - sized as a percentage of the company's
     actual monthly revenue in dollars, split into payments at the
-    archetype's typical frequency, to a synthesized supplier counterparty.
-    Archetypes with no real restocking (professional/real-estate/
-    financial services) are simply absent from restocking_pct_of_revenue
-    and skipped.
+    archetype's typical frequency, to a supplier drawn from the persistent
+    pool (scripts/add_counterparty_pools.py) and reused across every
+    payment this company makes. Archetypes with no real restocking
+    (professional/real-estate/financial services) are simply absent from
+    restocking_pct_of_revenue and skipped.
 
     revenue_monthly_target is a transaction *frequency* (revenue txns/
     month), the same way merchant_frequency is - not a dollar figure.
@@ -993,13 +1059,7 @@ def generate_restocking_transactions(
             owner_name=company.get("name", ""),
             address=company.get("address", "")
         )
-        supplier = ProfileAccount(
-            id=generate_uuid(),
-            owner_id=generate_uuid(8),
-            owner_type="Company",
-            owner_name=fake.company(),
-            address=fake.address().replace("\n", ", ")
-        )
+        supplier = _draw_pool_counterparty(supplier_pool)
 
         for _ in range(num_payments):
             payment_type = random.choice(spec["payment_types"])
@@ -1007,10 +1067,14 @@ def generate_restocking_transactions(
             timestamp = ts_dt.strftime("%Y-%m-%d %H:%M:%S")
             post_date = generate_post_date(ts_dt).strftime("%Y-%m-%d %H:%M:%S")
 
-            # supplier is a synthetic, non-known counterparty (same pattern
-            # as landlord/utility provider), so only the debit leg ever
-            # actually gets emitted - credit_timestamp is a no-op today but
-            # kept for consistency/future-proofing if that ever changes.
+            # supplier is now a real, known, bank-homed pool account (see
+            # _draw_pool_counterparty) - both legs emit. The wire branch
+            # below can still internationalize it for genuine cross-border
+            # restocking; when that happens it must get a fresh id rather
+            # than reuse the pooled one, so the international instance
+            # stays untracked/foreign like every other international wire
+            # counterparty in this codebase - a real international
+            # supplier wouldn't bank at our own domestic bank.
             credit_timestamp = credit_post_date = None
             if payment_type.lower() in ("check", "c_check"):
                 credit_ts_dt, credit_pd_dt = compute_check_clearing_dates(payment_type, ts_dt)
@@ -1154,6 +1218,7 @@ def generate_large_personal_withdrawals(
     register,
     start_dt: datetime,
     end_dt: datetime,
+    ledger=None,
 ) -> None:
     """An occasional, one-off large OTC cash withdrawal per person - savings
     drawn down for a big purchase (e.g. a used car), not tied to any
@@ -1162,6 +1227,15 @@ def generate_large_personal_withdrawals(
     Always branch-sourced - well beyond any ATM daily cap anyway, but
     explicit rather than relying on choose_cash_withdrawal's cap-overflow
     fallback.
+
+    ``ledger`` (optional): this discretionary, non-essential withdrawal is
+    skipped if the person's live approximate balance can't cover it (within
+    config/payment_ranges.yaml's overdraft_limit_person) - the funding-check
+    proof of concept for Phase 2's internal balance system. Recurring
+    essential obligations (rent, payroll, utilities) are deliberately NOT
+    gated this way - those aren't optional to skip, an account that can't
+    cover them is a real overdraft, which is what the ledger's overdraft
+    allowance and validate.py's balance gate are for instead.
     """
     spec = PAYMENT_RANGES["large_personal_withdrawal"]
     persons = profile_df[profile_df["type"] == "person"]
@@ -1195,6 +1269,10 @@ def generate_large_personal_withdrawals(
             bent_loc = fake.address().replace("\n", ", ")
 
         amount = round(random.uniform(amount_range[0], amount_range[1]), 2)
+        if ledger is not None:
+            overdraft = PAYMENT_RANGES.get("overdraft_limit_person", 0)
+            if not ledger.check_sufficient_funds(person_acct.id, amount, overdraft_limit=overdraft):
+                continue
         ts_dt = generate_transaction_timestamp(start_dt, end_dt, entity_type="Person")
         timestamp = ts_dt.strftime("%Y-%m-%d %H:%M:%S")
         post_date = generate_post_date(ts_dt).strftime("%Y-%m-%d %H:%M:%S")
@@ -1432,10 +1510,19 @@ def generate_profile_transactions(
     start_date: str,
     end_date: str,
     max_transactions: int | None = None,
+    ledger=None,
 ) -> tuple[list[dict], int]:
     """Generate transactions using structured agent profiles.
 
     Returns a tuple of (ledger_entries, base_transaction_count).
+
+    ``ledger`` (generator/ledger.py's LedgerState, optional) gets a live,
+    approximate balance update per registered entry - used only for
+    generation-time funding checks (see generate_large_personal_withdrawals).
+    It is NOT the source of the authoritative running_balance column - that
+    is computed once, after legit + injected rows are both fully assembled,
+    by main.py's call to compute_running_balances(), since this function's
+    own per-payer/per-category loops don't run in true chronological order.
     """
     start_dt = datetime.strptime(start_date, "%Y-%m-%d")
     end_dt = datetime.strptime(end_date, "%Y-%m-%d")
@@ -1476,6 +1563,11 @@ def generate_profile_transactions(
 
         if limit_reached:
             return False
+
+        if ledger is not None:
+            for entry in entries:
+                signed = entry["amount"] if entry["direction"] == "credit" else -entry["amount"]
+                ledger.apply_entry(entry["account_id"], signed)
 
         transactions.extend(entries)
         base_txn_count += 1
@@ -1780,6 +1872,7 @@ def generate_profile_transactions(
     # deposit loop below.
     generate_company_revenue_transactions(
         companies_df=companies_df,
+        revenue_customer_pool=profile_df[profile_df["type"] == "revenue_customer"],
         bents_by_bank=bents_by_bank,
         known_accounts=known_accounts,
         register=register,
@@ -1790,6 +1883,7 @@ def generate_profile_transactions(
     )
     generate_daily_card_settlement(
         companies_df=companies_df,
+        card_processor_pool=profile_df[profile_df["type"] == "card_processor"],
         known_accounts=known_accounts,
         register=register,
         start_dt=start_dt,
@@ -1818,6 +1912,7 @@ def generate_profile_transactions(
     )
     generate_restocking_transactions(
         companies_df=companies_df,
+        supplier_pool=profile_df[profile_df["type"] == "supplier"],
         known_accounts=known_accounts,
         register=register,
         start_dt=start_dt,
@@ -1839,6 +1934,7 @@ def generate_profile_transactions(
         register=register,
         start_dt=start_dt,
         end_dt=end_dt,
+        ledger=ledger,
     )
     generate_c_check_gl_transactions(
         profile_df=profile_df,

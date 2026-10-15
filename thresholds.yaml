@@ -12,6 +12,17 @@
 
 review_date_range_days: 30  # analyst lookback window applied at review time, not generation time
 
+# Any business or entity is eligible for injected suspicious activity
+# (Rio's call, 2026-09-02) - not just the sampled person/company roster,
+# but merchants and the counterparty pools (landlord/utility_provider/
+# supplier/card_processor) too. Those now vastly outnumber the sampled
+# roster in pattern_accounts (roughly 316 vs 16-56 in a typical run), so
+# an unweighted pick would rarely land on the roster at all - the exercise
+# is about the sampled customers, so flagging leans back toward them while
+# still leaving every other entity genuinely reachable. DRAFT, Rio's to
+# retune.
+roster_weight_for_flagging: 0.85
+
 # Multi-rule alerts (Rio's call, 2026-07-10): real alerts aren't always one
 # account/one rule - overlapping behavior can trip more than one rule on
 # the same account within the same review period, and a real alert system

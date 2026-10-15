@@ -386,6 +386,12 @@ unearned_income:
 # cap is hit for the day, further cash need for that day routes to a
 # branch/teller withdrawal instead. DRAFT - reasonable estimates, not tied
 # to any specific bank's actual limits.
+# atm_denomination is the smallest note an ATM dispenses - every ATM
+# withdrawal amount rounds up to a multiple of this. All modeled ATMs use
+# the same $20 cash-note denomination; no coin-dispensing ATM type is
+# modeled today (branch/teller cash stays exact-amount and uncapped).
+atm_denomination: 20
+
 atm_daily_limit:
   P1: 300
   P2: 300
@@ -393,6 +399,52 @@ atm_daily_limit:
   P4: 500
   P5: 800
   P6: 800
+
+# ---------------------------------------------------------------------------
+# OPENING BALANCES (internal-only ledger, see generator/ledger.py)
+# ---------------------------------------------------------------------------
+# Segment/size-tier-aware starting balance drawn once per sampled person/
+# company account at the start of a run. Never exported to any student-
+# facing file - internal only, used for validate.py's balance-integrity
+# gates and generation-time funding checks. DRAFT - reasonable estimates
+# consistent with each segment/tier's own spending scale elsewhere in this
+# file, not researched to the same depth as the payment-rail tables.
+opening_balance_ranges:
+  persons:
+    P1: [200, 2000]
+    P2: [500, 4000]
+    P3: [1000, 8000]
+    P4: [2000, 15000]
+    P5: [5000, 30000]
+    P6: [10000, 75000]
+  companies:
+    small: [5000, 50000]
+    mid: [25000, 250000]
+    large: [100000, 2000000]
+  # card_processor (generator/transactions.py's generate_daily_card_
+  # settlement, scripts/add_counterparty_pools.py) is the one persistent
+  # counterparty pool that is NOT receive-only - it's the SOURCE of daily
+  # card-settlement deposits (real-world card processors hold substantial
+  # pre-funded settlement float, backed by the broader card-network/
+  # interchange system this generator doesn't model). Found 2026-09-02:
+  # a $0 opening balance sent every card_processor deeply negative
+  # immediately. landlord/utility_provider/supplier stay at 0 - they are
+  # genuinely receive-only, confirmed on real output (0 of their tracked
+  # accounts ever went negative).
+  card_processor: [500000, 2000000]
+  # revenue_customer/self_employment_client (scripts/add_customer_pools.py,
+  # Checkpoint 3) are also PAYERS, not receive-only - same lesson as
+  # card_processor above, smaller scale (an ordinary customer/client, not
+  # a payment-network intermediary).
+  customer_pool: [10000, 100000]
+
+# Flat overdraft allowance for person accounts only - a negative
+# running_balance within this buffer is "explained" (validate.py's
+# no_negative_running_balance gate allows it); beyond it is a real FAIL.
+# Companies get no overdraft (0) - DRAFT, same status as every other
+# number in this file.
+overdraft_limit_person: 500
+overdraft_limit_company: 0
 
 # ---------------------------------------------------------------------------
 # BUSINESS OTC CASH (companies only, cash-heavy archetypes only). Weekly

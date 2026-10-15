@@ -11,7 +11,11 @@ from faker import Faker
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from generator.transactions import generate_profile_transactions, ProfileAccount, get_company_owners, get_person_segment
+from generator.transactions import (
+    generate_profile_transactions, ProfileAccount, get_company_owners, get_person_segment,
+    draw_opening_balance, PAYMENT_RANGES,
+)
+from generator.ledger import LedgerState, compute_running_balances
 from generator.exporter import export_to_csv_by_bank, export_to_excel_by_bank
 from generator.rule_taxonomy import parse_rule_id
 from generator.rule_injectors import inject_dst, inject_eat, inject_cty, inject_mbd, inject_est, inject_eop, inject_ftf
@@ -27,6 +31,34 @@ def build_bents_by_bank(profile_df: pd.DataFrame) -> dict:
         str(bank): g[["name", "address"]].to_dict("records")
         for bank, g in bent_df.groupby("bank")
     }
+
+
+def split_roster_and_counterparty_pools(pattern_accounts: list) -> tuple[list, list]:
+    """Split pattern_accounts into the sampled roster (persons/companies)
+    and everything else (merchants/landlord/utility_provider/supplier/
+    card_processor) - used to weight injection-target selection back
+    toward the roster (see pick_weighted_account) now that any entity is
+    eligible (Rio's call, 2026-09-02) but merchants+pools vastly outnumber
+    the roster in pattern_accounts."""
+    roster = [a for a in pattern_accounts if a.owner_type in ("Person", "Company")]
+    counterparty = [a for a in pattern_accounts if a.owner_type not in ("Person", "Company")]
+    return roster, counterparty
+
+
+def pick_weighted_account(roster_pool: list, counterparty_pool: list, roster_weight: float,
+                           exclude_ids: set | None = None) -> "ProfileAccount":
+    """Pick one account, leaning `roster_weight` toward the sampled
+    roster over merchants/counterparty pools (thresholds.yaml's
+    roster_weight_for_flagging) - falls back to whichever pool actually
+    has eligible candidates left if one side is exhausted or empty.
+    exclude_ids lets a caller building a set of distinct accounts retry
+    without repicking one already chosen."""
+    exclude_ids = exclude_ids or set()
+    roster_candidates = [a for a in roster_pool if a.id not in exclude_ids]
+    counterparty_candidates = [a for a in counterparty_pool if a.id not in exclude_ids]
+    if roster_candidates and (not counterparty_candidates or random.random() < roster_weight):
+        return random.choice(roster_candidates)
+    return random.choice(counterparty_candidates)
 
 
 def dispatch_injector(parsed, account, rule_id, rule_def, window_start, window_end,
@@ -107,6 +139,8 @@ def run_rule_injections(rule_config_path, thresholds_path, pattern_accounts,
     high_risk_countries_cache = []  # loaded lazily, only if a CTY instance is requested
     window_start = datetime.strptime(start_date, "%Y-%m-%d")
     window_end = datetime.strptime(end_date, "%Y-%m-%d")
+    roster_weight = thresholds.get("roster_weight_for_flagging", 1.0)
+    roster_pool, counterparty_pool = split_roster_and_counterparty_pools(pattern_accounts)
 
     laundering_txns = []
     for entry in rule_config.get("instances", []):
@@ -123,7 +157,7 @@ def run_rule_injections(rule_config_path, thresholds_path, pattern_accounts,
         parsed = parse_rule_id(rule_id)
 
         for _ in range(count):
-            account = random.choice(pattern_accounts)
+            account = pick_weighted_account(roster_pool, counterparty_pool, roster_weight)
             rows = dispatch_injector(parsed, account, rule_id, rule_def, window_start, window_end,
                                       known_accounts_set, bents_by_bank, high_risk_countries_cache,
                                       accounts_by_party_id)
@@ -189,7 +223,20 @@ def run_rule_injections_by_count(n_flagged, thresholds_path, pattern_accounts,
     window_start = datetime.strptime(start_date, "%Y-%m-%d")
     window_end = datetime.strptime(end_date, "%Y-%m-%d")
 
-    flagged_accounts = random.sample(pattern_accounts, n_flagged)
+    # Any business or entity is eligible for injected suspicious activity
+    # (Rio's call, 2026-09-02), but merchants/counterparty pools now vastly
+    # outnumber the sampled roster in pattern_accounts - an unweighted pick
+    # would rarely land on the roster at all. Lean flagging back toward
+    # the roster (thresholds.yaml's roster_weight_for_flagging) while
+    # keeping every other entity genuinely reachable.
+    roster_weight = thresholds.get("roster_weight_for_flagging", 1.0)
+    roster_pool, counterparty_pool = split_roster_and_counterparty_pools(pattern_accounts)
+    flagged_accounts = []
+    chosen_ids: set = set()
+    for _ in range(n_flagged):
+        account = pick_weighted_account(roster_pool, counterparty_pool, roster_weight, chosen_ids)
+        chosen_ids.add(account.id)
+        flagged_accounts.append(account)
 
     def pick_rule_id(account_type):
         rule_ids = list(built_rules.keys())
@@ -304,10 +351,14 @@ def split_answer_key(all_txns):
     """
     answer_key_rows = []
     student_rows = []
-    excluded_from_student = set(ANSWER_KEY_FIELDS) | {"timestamp"}
+    # running_balance is internal-only (generator/ledger.py) - never in the
+    # student file, and not in the answer key either unless a future
+    # exercise config specifically asks for it (see Phase 2 plan notes).
+    internal_only = {"running_balance"}
+    excluded_from_student = set(ANSWER_KEY_FIELDS) | {"timestamp"} | internal_only
     for row in all_txns:
         if row.get("rule_id"):
-            answer_key_rows.append({k: v for k, v in row.items() if k != "timestamp"})
+            answer_key_rows.append({k: v for k, v in row.items() if k not in ({"timestamp"} | internal_only)})
         else:
             answer_key_rows.append({
                 "entry_id": row["entry_id"],
@@ -364,9 +415,28 @@ def main():
     log(f"📂 Loading agent profiles from {args.agent_profiles}")
     profile_df = pd.read_excel(args.agent_profiles, sheet_name="Combined_Data")
 
+    # account_number/aba_routing_number are identifiers, not quantities - the source
+    # workbook stores them as whole numbers, and pandas upgrades them to float64 the
+    # moment any row is NaN (e.g. a merchant with no bank account). Left uncast, any
+    # export path that reads these columns directly (not through ProfileAccount, which
+    # already str()s its id) would leak "4056079103.0"-style values. Fix once at load
+    # time rather than chasing every read site.
+    for id_col in ("account_number", "aba_routing_number"):
+        profile_df[id_col] = profile_df[id_col].apply(lambda v: str(int(v)) if pd.notna(v) else v)
+
     persons_pool = profile_df[profile_df["type"] == "person"]
     companies_pool = profile_df[profile_df["type"] == "company"]
-    non_customer_rows = profile_df[profile_df["type"].isin(["merchant", "BEnt", "bank"])]
+    # landlord/utility_provider/supplier/card_processor (scripts/add_counterparty_
+    # pools.py) are persistent counterparty pools, same "never sampled down,
+    # always fully available" treatment as merchants - generator/transactions.py
+    # draws from these pools instead of fabricating a disposable fake identity.
+    # revenue_customer/self_employment_client (scripts/add_customer_pools.py)
+    # are the same idea but scoped PER OWNER (owner_entity_id) rather than
+    # shared - Checkpoint 3, 2026-09-02.
+    non_customer_rows = profile_df[profile_df["type"].isin([
+        "merchant", "BEnt", "bank", "landlord", "utility_provider", "supplier", "card_processor",
+        "revenue_customer", "self_employment_client",
+    ])]
 
     if args.n_persons > len(persons_pool):
         log(f"❌ --n_persons {args.n_persons} exceeds the available pool ({len(persons_pool)} person rows "
@@ -405,7 +475,14 @@ def main():
     # The rule injectors (generator/rule_injectors.py) only ever read
     # .id/.bank off account objects, so a list of ProfileAccount stand-ins
     # is enough to place injected rows against real sampled accounts.
-    customer_rows = profile_df[profile_df["type"].isin(["person", "company"])]
+    # Any business or entity is eligible for injected suspicious activity
+    # (Rio's call, 2026-09-02) - not just sampled persons/companies, but
+    # merchants and every counterparty pool too, now that they're all real
+    # tracked accounts.
+    customer_rows = profile_df[profile_df["type"].isin([
+        "person", "company", "merchant", "landlord", "utility_provider", "supplier", "card_processor",
+        "revenue_customer", "self_employment_client",
+    ])]
     pattern_accounts = [
         ProfileAccount(
             id=row["account_number"] if pd.notna(row["account_number"]) else row["entity_id"],
@@ -437,11 +514,87 @@ def main():
     for account in pattern_accounts:
         accounts_by_party_id.setdefault(account.party_id, []).append(account)
 
+    # Internal-only balance ledger (generator/ledger.py) - opening balance
+    # drawn once per sampled person/company account, segment/size-tier
+    # aware. Never reaches any student-facing export; see split_answer_key.
+    ledger = LedgerState()
+    for account in pattern_accounts:
+        opening = draw_opening_balance(account.owner_type, account.segment, account.transaction_scaler)
+        ledger.register_account(account.id, opening)
+
+    # Merchants and every counterparty pool (scripts/add_counterparty_
+    # pools.py, scripts/add_customer_pools.py) are real, bank-homed
+    # accounts now too (2026-09-02, "coherent virtual banking world" work)
+    # - ledger-tracked, opening balance 0 for the receive-only ones
+    # (merchant/landlord/utility_provider/supplier - nothing generates an
+    # outflow from their own account) and a real float range for the
+    # types that are actually PAYERS - card_processor (the source of daily
+    # card-settlement deposits) and revenue_customer/self_employment_
+    # client (the source of company revenue / self-employment income
+    # payments). Confirmed on real output during Checkpoint 2: a $0
+    # opening balance sends every payer-type account deeply negative
+    # immediately.
+    receive_only_types = ["merchant", "landlord", "utility_provider", "supplier"]
+    for _, row in non_customer_rows[non_customer_rows["type"].isin(receive_only_types)].iterrows():
+        acct_num = row.get("account_number")
+        if pd.notna(acct_num):
+            ledger.register_account(str(acct_num), 0.0)
+    payer_type_ranges = {
+        "card_processor": PAYMENT_RANGES["opening_balance_ranges"]["card_processor"],
+        "self_employment_client": PAYMENT_RANGES["opening_balance_ranges"]["customer_pool"],
+    }
+    for payer_type, float_range in payer_type_ranges.items():
+        for _, row in non_customer_rows[non_customer_rows["type"] == payer_type].iterrows():
+            acct_num = row.get("account_number")
+            if pd.notna(acct_num):
+                ledger.register_account(str(acct_num), round(random.uniform(*float_range), 2))
+
+    # revenue_customer needs a scale-aware float, not the flat customer_pool
+    # range - found on real output: a flat $10K-$100K starting balance went
+    # deeply negative for pool entities owned by large B2B companies, where
+    # a single residual-revenue transaction can be tens of thousands. Each
+    # of a company's 8 pool customers gets a generous half-share of that
+    # company's own real monthly revenue (revenue_monthly_target x
+    # average_expense, the same math generate_company_revenue_transactions
+    # uses) as a floor, so even an unlucky run of repeated draws on one
+    # customer stays funded.
+    company_scale = profile_df[profile_df["type"] == "company"].set_index("entity_id")
+    customer_pool_floor, customer_pool_ceiling = PAYMENT_RANGES["opening_balance_ranges"]["customer_pool"]
+    # Same months_in_range formula generator/transactions.py uses to size
+    # channel_target_total - a flat monthly figure isn't enough headroom
+    # for a multi-month exercise (found on real output: still 46 of 249
+    # negative after a monthly-only floor). Each of a company's 8 pool
+    # customers gets a generous half-share of the FULL date-range revenue
+    # total as a floor, not just one month's worth, so even an unlucky run
+    # of repeated draws on one customer stays funded.
+    _start_dt = datetime.strptime(args.start_date, "%Y-%m-%d")
+    _end_dt = datetime.strptime(args.end_date, "%Y-%m-%d")
+    months_in_range = max(1.0, (_end_dt - _start_dt).days / 30.0)
+    for _, row in non_customer_rows[non_customer_rows["type"] == "revenue_customer"].iterrows():
+        acct_num = row.get("account_number")
+        if pd.isna(acct_num):
+            continue
+        owner = company_scale.loc[row["owner_entity_id"]] if row["owner_entity_id"] in company_scale.index else None
+        scaled_float = customer_pool_ceiling
+        if owner is not None and pd.notna(owner.get("revenue_monthly_target")) and pd.notna(owner.get("average_expense")):
+            range_revenue_dollars = float(owner["revenue_monthly_target"]) * float(owner["average_expense"]) * months_in_range
+            # 2x (not a tight fraction) - with only 8 customers per company
+            # and uniform random draws, one customer can plausibly get
+            # picked for most of a company's transactions in a given run
+            # (confirmed on real output: one customer covered 6 payments,
+            # $398K total). Over-provisioning these peripheral accounts
+            # has no real downside - they're not the focus of the
+            # exercise, just needs enough headroom to stay funded.
+            scaled_float = max(customer_pool_ceiling, range_revenue_dollars * 2.0)
+        opening = round(random.uniform(customer_pool_floor, scaled_float), 2)
+        ledger.register_account(str(acct_num), opening)
+
     legit_txns, base_txn_count = generate_profile_transactions(
         profile_df=profile_df,
         start_date=args.start_date,
         end_date=args.end_date,
         max_transactions=args.legit_txns,
+        ledger=ledger,
     )
     log(
         f"✅ Profile-based transactions generated: {base_txn_count} base transactions "
@@ -479,6 +632,13 @@ def main():
     # about a real account's mixed activity, not a dataset with perfect
     # money-trail provenance - see Rio's call, 2026-07-10.
     all_txns = legit_txns + laundering_txns
+
+    # Canonical, chronologically-correct running_balance (generator/ledger.py) -
+    # computed once here, now that every row (legit + injected) is fully
+    # assembled, since generation and injection each run in their own
+    # internal order rather than true global chronological order. Internal
+    # only - split_answer_key strips this from every exported file.
+    compute_running_balances(all_txns, ledger.opening_balances)
 
     # in_package: "y" if this row's account_id is one of the sampled
     # persons/companies (customer_rows - the same roster customer_info is
@@ -559,7 +719,11 @@ def main():
     person_account_ids = frozenset(
         profile_df.loc[profile_df["type"] == "person", "account_number"].dropna().astype(str)
     )
-    results = run_all_checks(validation_df, args.start_date, args.end_date, person_account_ids)
+    results = run_all_checks(
+        validation_df, args.start_date, args.end_date, person_account_ids,
+        overdraft_limit_person=PAYMENT_RANGES.get("overdraft_limit_person", 0),
+        overdraft_limit_company=PAYMENT_RANGES.get("overdraft_limit_company", 0),
+    )
     if not print_report(results):
         log("❌ Validation failed - no output written.", level="ERROR")
         sys.exit(1)
@@ -577,19 +741,24 @@ def main():
         export_to_excel_by_bank(rows_by_bank, args.output)
 
     # Customer information: static identity facts (not transactions) for
-    # the sampled accounts under review - name, address, and type_of_business:
-    # a company's industry (naics_description) or a person's own occupation
+    # every account with a real presence in this bank's own world - name,
+    # address, and type_of_business: a company/merchant/counterparty-pool
+    # entity's industry (naics_description) or a person's own occupation
     # (scripts/assign_occupations.py) - same column, content depends on row
-    # type, not blank for persons anymore. Scoped to customer_rows (the
-    # sampled persons/companies), not merchants/BEnts - those are
-    # counterparties, not this bank's own customers. Partitioned by bank
-    # for the same reason the transaction files are. alert_rule is blank
-    # for the (large majority of) accounts with no injected activity -
-    # that's correct, not a bug, same as is_laundering/in_package.
+    # type. Same roster as customer_rows above - any business or entity is
+    # eligible for injected suspicious activity, so any business or entity
+    # gets a customer_info row too. Partitioned by bank for the same
+    # reason the transaction files are. alert_rule is blank for the large
+    # majority of accounts with no injected activity - that's correct, not
+    # a bug, same as is_laundering/in_package.
+    business_like_types = {
+        "company", "merchant", "landlord", "utility_provider", "supplier", "card_processor",
+        "revenue_customer", "self_employment_client",
+    }
     customer_info_by_bank: dict[str, list] = {}
     for _, row in customer_rows.iterrows():
         bank = bank_code_to_name.get(row.get("bank"), "Unknown Bank")
-        type_of_business = row.get("naics_description") if row.get("type") == "company" else row.get("occupation")
+        type_of_business = row.get("naics_description") if row.get("type") in business_like_types else row.get("occupation")
         customer_info_by_bank.setdefault(bank, []).append({
             "customer_id": row.get("customer_id"),
             "account_number": row.get("account_number"),
