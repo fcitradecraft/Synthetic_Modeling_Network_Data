@@ -24,6 +24,16 @@ from validate import run_all_checks, print_report
 
 ANSWER_KEY_FIELDS = ["is_laundering", "rule_id", "typology", "role_in_typology", "difficulty"]
 
+# The shared master list of everyone in the fictional universe lives in its
+# own repo (fcitradecraft/Fictional_Universe), cloned next to this one, so
+# every data generator reads the same file. FICTIONAL_UNIVERSE_PROFILES
+# overrides the location if it's cloned somewhere else.
+DEFAULT_AGENT_PROFILES = os.environ.get(
+    "FICTIONAL_UNIVERSE_PROFILES",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                 "Fictional_Universe", "agent_profiles.xlsx"),
+)
+
 
 def build_bents_by_bank(profile_df: pd.DataFrame) -> dict:
     bent_df = profile_df[profile_df["type"] == "BEnt"]
@@ -380,8 +390,9 @@ def main():
                          help="Power-user override: path to a rule-trigger YAML (rule_id + exact instance counts), "
                               "dispatched via thresholds.yaml. Mutually exclusive with --n_flagged.")
     parser.add_argument("--thresholds", type=str, default="thresholds.yaml", help="Path to thresholds.yaml")
-    parser.add_argument("--agent_profiles", type=str, default="agents/agent_profiles.xlsx",
-                         help="Path to agent profiles Excel file (the sole identity source)")
+    parser.add_argument("--agent_profiles", type=str, default=DEFAULT_AGENT_PROFILES,
+                         help="Path to agent profiles Excel file (the sole identity source) - defaults to "
+                              "the shared ../Fictional_Universe/agent_profiles.xlsx")
     parser.add_argument("--output", type=str, default="data/aml_dataset.csv", help="Output file path")
     parser.add_argument("--customer_info", type=str, default="data/customer_info.csv",
                          help="Customer information output path (name/address/type of business for sampled accounts)")
@@ -412,6 +423,10 @@ def main():
         Faker.seed(args.seed)
         log(f"🌱 Seeded RNG with --seed {args.seed}")
 
+    if not os.path.exists(args.agent_profiles):
+        log(f"❌ Agent profiles not found at {args.agent_profiles}. Clone fcitradecraft/Fictional_Universe "
+            f"next to this repo, set FICTIONAL_UNIVERSE_PROFILES, or pass --agent_profiles.", level="ERROR")
+        sys.exit(1)
     log(f"📂 Loading agent profiles from {args.agent_profiles}")
     profile_df = pd.read_excel(args.agent_profiles, sheet_name="Combined_Data")
 

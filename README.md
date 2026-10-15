@@ -35,7 +35,7 @@ Every example below assumes you're running from the repo root with that venv act
   --seed 42 --start_date 2025-01-01 --end_date 2025-03-31
 ```
 
-This samples 6 persons and 10 companies from `agents/agent_profiles.xlsx`, flags 3 of those 16
+This samples 6 persons and 10 companies from the shared profiles file (see below), flags 3 of those 16
 accounts with a rule-based suspicious pattern each, and writes everything to `data/`. Same
 `--seed` + same arguments always reproduces byte-identical output.
 
@@ -183,7 +183,7 @@ don't re-run them).
 | `--seed` | none | Random seed - same seed + same args → byte-identical output |
 | `--start_date` / `--end_date` | `2025-01-01` / `2025-01-31` | Transaction date range |
 | `--legit_txns` | uncapped | Optional safety-valve ceiling on base (pre-injection) transaction count |
-| `--agent_profiles` | `agents/agent_profiles.xlsx` | Identity source workbook |
+| `--agent_profiles` | `../Fictional_Universe/agent_profiles.xlsx` | Identity source workbook (or set `FICTIONAL_UNIVERSE_PROFILES`) |
 | `--thresholds` | `thresholds.yaml` | Per-rule firing parameters |
 | `--output` | `data/aml_dataset.csv` | Student transaction file (partitioned per bank) |
 | `--customer_info` | `data/customer_info.csv` | Customer info file (partitioned per bank) |
@@ -195,7 +195,22 @@ don't re-run them).
 
 ## Data and config files
 
-### `agents/agent_profiles.xlsx` → `Combined_Data` sheet
+### `agent_profiles.xlsx` → `Combined_Data` sheet (lives in a separate repo)
+
+The profiles workbook is **not in this repo**. It's the shared master list for every FCI
+Tradecraft data generator, kept in its own private repo, `fcitradecraft/Fictional_Universe`,
+cloned next to this one:
+
+```
+New_Code_Files_Git/
+  Synthetic_Modeling_Network_Data/   <- this repo
+  Fictional_Universe/                <- agent_profiles.xlsx, EDITING_GUIDE.md, check_profiles.py
+```
+
+`main.py` reads `../Fictional_Universe/agent_profiles.xlsx` by default. If it's cloned somewhere
+else, set `FICTIONAL_UNIVERSE_PROFILES=/path/to/agent_profiles.xlsx` or pass `--agent_profiles`.
+Edit it there, never here - see that repo's `EDITING_GUIDE.md`, and run its `check_profiles.py`
+after every edit.
 
 The sole identity source - the generator reads **only** this sheet; the workbook's other tabs
 (`People`, `Companies1`, `Merchants2`, `BankEntitites`, `banks`, `Sheet1`) are legacy source
@@ -220,7 +235,7 @@ rules (see "How a run works" above). `owner_entity_id` ties each `revenue_custom
 Rows link to each other by `entity_id` (`employer`, `owners`, `owner_entity_id`, `party_id`), never
 by name - so `name`, `address`, `phone_number`, `email`, and `occupation` can be edited freely.
 Never change an existing `entity_id`, keep `account_number`/`ssn`/`customer_id` unique, and use
-only the 5 bank codes above in `bank`.
+only the 5 bank codes above in `bank` - the Fictional_Universe checker enforces all of this.
 
 ### `thresholds.yaml`
 
@@ -433,9 +448,11 @@ config/
   high_risk_countries.yaml         CTY/EOP rule watchlist
   trade_countries.yaml             Ordinary international trading partners (legitimate wires)
 agents/
-  agent_profiles.xlsx              Identity source (Combined_Data sheet)
+  agent_profiles_source.xlsx       Original pre-2026 source workbook (historical, not read)
 scripts/                          One-off calibration/migration scripts already run against
-                                  agent_profiles.xlsx (kept for reference, not part of a normal run)
+                                  the profiles workbook (kept for reference, not part of a normal
+                                  run - they still point at the old agents/agent_profiles.xlsx
+                                  path, so they can't accidentally rewrite the shared master)
 webui/
   app.py                          Local Flask page that runs main.py and returns a zip
   run_ui.sh                       One-command launcher (./webui/run_ui.sh)

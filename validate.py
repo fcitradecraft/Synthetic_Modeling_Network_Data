@@ -165,7 +165,7 @@ def check_person_card_direction(df: pd.DataFrame, person_account_ids: frozenset 
     gate is guarding against future regression, not fixing an active bug.
 
     Needs to know which accounts are persons - validate.py otherwise never
-    cross-references agents/agent_profiles.xlsx, so main.py passes this in
+    cross-references the agent profiles workbook, so main.py passes this in
     (built the same way it already builds known_accounts_set). Defaults to
     an empty set, in which case this gate can't find any person rows to
     check and PASSes vacuously - same tradeoff every schema-dependent gate
