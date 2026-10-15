@@ -41,15 +41,61 @@ accounts with a rule-based suspicious pattern each, and writes everything to `da
 
 Use `--n_flagged 0` for guaranteed-clean output - no injection call is made at all.
 
+### Web UI (no command line needed)
+
+```bash
+./webui/run_ui.sh
+```
+
+Starts a local web page at `http://127.0.0.1:5000` (installs Flask on first run if it's missing,
+then opens the browser). Fill in persons, companies, number flagged, seed, date range and format,
+and it runs `main.py` behind the scenes and downloads everything as one zip
+(`aml_exercise_<timestamp>.zip`). Stop it with Ctrl+C in the terminal.
+
+---
+
+## The simulated banking world
+
+Every account in this generator banks somewhere real (within the fiction). There are **5 banks**,
+each with its own bank code, SWIFT/BIC, ABA routing number, and branch/ATM (`BEnt`) rows:
+
+| Code | Bank | Role |
+|---|---|---|
+| 138 | Misfits Savings and Loan | Credit union - persons/companies |
+| 211 | Wells Farquod | Commercial - persons/companies |
+| 513 | Bank of Pineland | Commercial - persons/companies |
+| 325 | Widgets & Merchants | Commerce-side home: merchants, card processors |
+| 647 | First Bank of Expense and Overhead | Overhead-side home: landlords, utilities, suppliers |
+
+Beyond the sampled persons/companies, every recurring counterparty is a **persistent, bank-homed,
+ledger-tracked account** in `Combined_Data`, not a throwaway fake name generated per transaction:
+
+| `type` | Count | What it is |
+|---|---|---|
+| `merchant` | 171 | Where persons/companies buy things |
+| `landlord` | 50 | Rent/mortgage payee, reused across a payer's whole rent history |
+| `utility_provider` | 35 | Electricity/phone/internet payee |
+| `supplier` | 35 | Company restocking/COGS payee |
+| `card_processor` | 25 | Source of daily card-settlement deposits to consumer-facing companies |
+| `revenue_customer` | 272 | 8 per company - the customers who pay it (scoped by `owner_entity_id`) |
+| `self_employment_client` | 64 | 8 per self-employed person - the clients who pay them |
+
+Bank assignment for the shared pools is a lean, not a rule - e.g. ~75% of landlords/utilities/
+suppliers bank at First Bank of Expense and Overhead, the rest spread across all 5 banks. These
+pools were built once by `scripts/add_new_banks.py`, `scripts/add_counterparty_pools.py`,
+`scripts/add_customer_pools.py`, and `scripts/rehome_merchants_to_new_banks.py` (already run -
+don't re-run them).
+
 ---
 
 ## How a run works
 
 1. **Sample.** `--n_persons`/`--n_companies` pull that many rows from `Combined_Data`'s person
    and company pools (capped today at 22 persons / 34 companies - the command hard-errors if you
-   ask for more than exist). Merchants, bank-entity (`BEnt`) rows, and banks themselves are never
-   sampled down; they stay fully available as counterparties, so the simulated world doesn't feel
-   artificially small even when the sampled customer roster is.
+   ask for more than exist). Merchants, every counterparty pool (see
+   [The simulated banking world](#the-simulated-banking-world)), bank-entity (`BEnt`) rows, and
+   banks themselves are never sampled down; they stay fully available as counterparties, so the
+   simulated world doesn't feel artificially small even when the sampled customer roster is.
    - **This is a floor, not an exact count.** A relational closure pass then pulls in any
      employer or owned company a sampled person is connected to, and any owner a sampled company
      is connected to, repeating until nothing new is needed - so an employed person's employer,
@@ -63,8 +109,15 @@ Use `--n_flagged 0` for guaranteed-clean output - no injection call is made at a
      unemployed-high-income) get an irregular client-payment or periodic-distribution channel
      instead, so no account is a pure spender with no funding source.
    - **Rent/mortgage and utilities** - every person and company pays a fixed monthly rent/
-     mortgage, plus three separate monthly bills (electricity, phone, internet), each with its
-     own small variance around a per-profile baseline.
+     mortgage to a real `landlord` account, plus three separate monthly bills (electricity,
+     phone, internet) to real `utility_provider` accounts, each with its own small variance
+     around a per-profile baseline.
+   - **Opening balances and funding checks** - every tracked account gets an opening balance
+     (`opening_balance_ranges` in `config/payment_ranges.yaml`, segment/size-tier aware) in an
+     internal ledger (`generator/ledger.py`). Discretionary withdrawals check that the money is
+     actually there (persons get a small overdraft allowance, `overdraft_limit_person`). After
+     generation, a true chronological `running_balance` is computed for validation only - it is
+     **never** written to any exported file.
    - **Owner distributions** - persons who own (solely or jointly) one of the ~18 owner-mapped
      companies (`scripts/assign_business_ownership.py`) get a monthly distribution on top of
      whatever salary/self-employment income they already have, split across joint owners by
@@ -95,8 +148,11 @@ Use `--n_flagged 0` for guaranteed-clean output - no injection call is made at a
      smaller OTC withdrawal to restock the register with change. Persons occasionally (~12%
      chance) make one large, one-off OTC withdrawal not tied to any purchase - cash for a big-
      ticket item like a used car.
-3. **Inject suspicious activity.** `--n_flagged` picks that many distinct sampled accounts and
-   fires a rule injector each, weighted by `account_type_weight` in `thresholds.yaml` (e.g.
+3. **Inject suspicious activity.** `--n_flagged` picks that many distinct accounts and fires a
+   rule injector each. Eligible accounts are the sampled persons/companies **and** any bank-homed
+   business or entity (merchants and every counterparty pool). Because those pools far outnumber
+   the roster, picks lean 85% toward the sampled roster (`roster_weight_for_flagging` in
+   `thresholds.yaml`). Rule choice is weighted by `account_type_weight` in `thresholds.yaml` (e.g.
    international wire activity is weighted toward companies). Most flagged accounts get one
    rule; per `thresholds.yaml`'s `rule_overlaps.pair_probability`, some instead get a pair of
    rules from a small, explicit, editable list of plausible overlaps (e.g. structuring cash
@@ -111,8 +167,8 @@ Use `--n_flagged 0` for guaranteed-clean output - no injection call is made at a
 4. **Validate.** `validate.py` runs 15 gates against the full transaction set before anything is
    written - see [Validation](#validation) below. Only a hard `FAIL` blocks export.
 5. **Export.** Transactions and customer info are partitioned **per bank** (a bank's own extract
-   only shows its own accounts' legs), plus one combined workbook across all banks and a unified
-   answer key.
+   only shows its own accounts' legs) across all 5 banks, plus one combined workbook across all
+   banks and a unified answer key.
 
 ---
 
@@ -141,8 +197,11 @@ Use `--n_flagged 0` for guaranteed-clean output - no injection call is made at a
 
 ### `agents/agent_profiles.xlsx` → `Combined_Data` sheet
 
-The sole identity source. Every row is a person, company, merchant, `BEnt` (bank branch/ATM), or
-bank, with columns including `entity_id`, `type`, `bank`, `account_number`, `name`, `address`,
+The sole identity source - the generator reads **only** this sheet; the workbook's other tabs
+(`People`, `Companies1`, `Merchants2`, `BankEntitites`, `banks`, `Sheet1`) are legacy source
+tabs nothing reads. Every row is a person, company, merchant, counterparty-pool entity
+(`landlord`, `utility_provider`, `supplier`, `card_processor`, `revenue_customer`,
+`self_employment_client`), `BEnt` (bank branch/ATM), or bank, with columns including `entity_id`, `type`, `bank`, `account_number`, `name`, `address`,
 `accepted_payment_methods`, `average_expense`, `transaction_scaler` (a size/spend multiplier),
 `merchant_patterns`/`merchant_frequency` (what a payer buys and how often), and, for persons,
 `dob`, `employment_status`, `employer`, `income_level`. `BEnt` rows supply the branch/ATM
@@ -155,7 +214,13 @@ now has a real 3-digit `naics_code`/`naics_description` (`scripts/backfill_legac
 closed the last gap on 11 legacy rows). `party_id` (`scripts/add_party_id.py`) groups a person
 with their employer under one shared ID - most rows are their own singleton party, but ~14
 accounts across 6 parties share an ID with a linked employer/business - used by the party-group
-rules (see "How a run works" above).
+rules (see "How a run works" above). `owner_entity_id` ties each `revenue_customer`/
+`self_employment_client` row to the one company/person it pays.
+
+Rows link to each other by `entity_id` (`employer`, `owners`, `owner_entity_id`, `party_id`), never
+by name - so `name`, `address`, `phone_number`, `email`, and `occupation` can be edited freely.
+Never change an existing `entity_id`, keep `account_number`/`ssn`/`customer_id` unique, and use
+only the 5 bank codes above in `bank`.
 
 ### `thresholds.yaml`
 
@@ -219,9 +284,10 @@ bank_name, owner_name, payment_type, source_description, post_date, in_package, 
 travel_rule_info, originator_beneficiary_info, counterparty_country_code, atm_id, atm_location`
 
 `amount` is always non-negative; `direction` (`debit`/`credit`) carries the sign. `atm_id`/
-`atm_location` are populated only on cash rows. `in_package` is `y` if `account_id` is one of the
-sampled persons/companies (the same roster `customer_info` is built from), `n` for everything
-else - a merchant, a supplier, a synthesized landlord/utility company, any external counterparty.
+`atm_location` are populated only on cash rows. `in_package` is `y` if `account_id` is on the
+same roster `customer_info` is built from - which now includes merchants and every counterparty
+pool, not just the sampled persons/companies - and `n` for everything else (GL accounts,
+external/international wire counterparties, anything not in `Combined_Data`).
 It's independent of the answer key: a real alert drags in related accounts/parties for review
 whether or not they personally turn out to have flagged transactions, so most `in_package=y` rows
 have no injected activity at all.
@@ -238,8 +304,13 @@ the real ISO code for an international one). No column here reveals which rows a
 
 `customer_id, account_number, type, name, address, type_of_business, bank_name, alert_rule`
 
-`type_of_business` shows a company's NAICS description or a person's own occupation
-(`scripts/assign_occupations.py`) - same column, content depends on row type.
+One row per account in the run: the sampled persons/companies plus every merchant and
+counterparty-pool entity, each in its own bank's file. `type_of_business` shows a business's
+NAICS description or a person's own occupation (`scripts/assign_occupations.py`) - same column,
+content depends on row type.
+
+There is no `running_balance` column in any export - it exists only inside the generator for
+validation (see [Validation](#validation)).
 
 `alert_rule` is a comma-separated list of the rule_id(s) that fired on that account (blank for
 the large majority with none) - standard in real AML alert systems, and it's what lets a student
@@ -295,7 +366,8 @@ across every sampled account sharing the flagged account's `party_id`, not just 
 
 1. No duplicate `entry_id`
 2. Debit/credit legs of a `transaction_id` balance to zero
-3. `running_balance` reconciles *(skipped - field not yet in schema)*
+3. `running_balance` reconciles - each tracked account's balance equals the prior balance plus
+   this row's signed amount, in true timestamp order
 4. `direction` is consistent with a non-negative `amount`
 5. `post_date` never falls on a weekend/federal holiday
 6. `post_date` never precedes the transaction timestamp
@@ -307,13 +379,15 @@ across every sampled account sharing the flagged account's `party_id`, not just 
 10. Every BIC is 8 or 11 characters *(skips only if the run has zero wire transactions at all)*
 11. No BIC matches a real institution *(same skip condition as above)*
 12. Injected rows fall within the configured date range
-13. No negative `running_balance` *(skipped - field not yet in schema)*
+13. No `running_balance` goes below the account's overdraft allowance (`overdraft_limit_person`
+    / `overdraft_limit_company` in `config/payment_ranges.yaml`)
 14. **Leakage** - no column predicts `is_laundering` above base rate
 15. **Clearing float gap** - a check/c_check's credit leg posts on or after its debit leg, within
     a sane window
 
-Only a hard `FAIL` blocks export (gates 1-2, 4-9, 12 - real correctness bugs). Gates 14-15 return
-`WARN` and still write output: a leak-free answer key isn't the goal, and at small account counts
+Only a hard `FAIL` blocks export (gates 1-9, 12 - real correctness bugs). Gate 13 returns `WARN`
+and still writes output - see Known limitations. Gates 14-15 also return `WARN` and still write
+output: a leak-free answer key isn't the goal, and at small account counts
 some incidental correlation (e.g. a specific bank's `swift_code`, an ATM branch from a small
 per-bank pool) is close to unavoidable, same as a check's clearing leg occasionally landing just
 past the exercise's own date window. `payment_type`, `date`, `in_package`,
@@ -345,6 +419,8 @@ generator/
                                   ATM mechanics
   rule_injectors.py               One injector per built rule subtype (DST/EAT/CTY/MBD/EST/EOP/FTR)
   rule_taxonomy.py                Parses the 7-token rule_id
+  ledger.py                       Internal-only balance ledger: funding checks and the
+                                  chronological running_balance validation uses
   exporter.py                     Per-bank CSV/XLSX writers
 utils/
   helpers.py                      Seeded UUIDs, timestamps, double-entry ledger splitting,
@@ -360,6 +436,9 @@ agents/
   agent_profiles.xlsx              Identity source (Combined_Data sheet)
 scripts/                          One-off calibration/migration scripts already run against
                                   agent_profiles.xlsx (kept for reference, not part of a normal run)
+webui/
+  app.py                          Local Flask page that runs main.py and returns a zip
+  run_ui.sh                       One-command launcher (./webui/run_ui.sh)
 ```
 
 ---
@@ -372,9 +451,13 @@ scripts/                          One-off calibration/migration scripts already 
 - Every threshold number besides the $10,000 CTR figure is a DRAFT judgment call pending sign-off
   - this now includes every parameter on the more recently built rules (EST/EOP/FTF), not just the
   original 8.
-- `running_balance` doesn't exist in the schema yet, so 2 of the 15 validation gates
-  (`running_balance_reconciliation`, `no_negative_running_balance`) are permanently `SKIP` until
-  that's built. The BIC gates only skip in the edge case of a run with zero wire activity at all.
+- **Accounts can run negative.** Revenue/expense generation was built before the ledger and
+  isn't balance-aware - a company's restocking isn't capped by its revenue, nor a person's
+  spending by their income. Gate 13 surfaces this as a `WARN` (expect it on multi-month runs);
+  fixing it is a separate rebalancing effort across every revenue/expense generator. The BIC
+  gates only skip in the edge case of a run with zero wire activity at all.
+- **Total company revenue lands ~1.3x over each archetype's target** - residual ACH/check weight
+  draws from a disproportionately wide range. DRAFT-quality, not yet chased.
 - At small account counts (roughly `n_persons + n_companies` under ~15), expect occasional
   leakage warnings - a small per-bank ATM/branch pool, or (since more wire-heavy rules were added)
   a bank's own `swift_code` showing mild correlation purely from a handful of wire rows landing on
